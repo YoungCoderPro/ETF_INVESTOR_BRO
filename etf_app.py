@@ -286,15 +286,62 @@ def monte_carlo(s: pd.Series, n_years=10, n_paths=2000, monthly_add=100.0) -> di
     return dict(p10=finals[int(n*.10)], p25=finals[int(n*.25)], p50=finals[int(n*.50)],
                 p75=finals[int(n*.75)], p90=finals[int(n*.90)], current=start_val)
 
-# ================================================================ PORTFOLIO FILE
+# ================================================================ PORTFOLIO — SUPABASE + LOCAL FALLBACK
+
+def _get_sb():
+    """Return a Supabase client if credentials are configured, else None."""
+    try:
+        from supabase import create_client
+        url = (st.secrets.get("SUPABASE_URL","") if hasattr(st,"secrets") else "") \
+              or os.environ.get("SUPABASE_URL","")
+        key = (st.secrets.get("SUPABASE_KEY","") if hasattr(st,"secrets") else "") \
+              or os.environ.get("SUPABASE_KEY","")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
 
 def load_portfolio() -> list:
+    """Load trades from Supabase if available, else local JSON."""
+    sb = _get_sb()
+    if sb:
+        try:
+            rows = sb.table("portfolio_trades").select("*").execute().data or []
+            return [{"id": r["id"], "ticker": r["ticker"],
+                     "date": str(r["date_bought"]), "amount": r["amount_usd"],
+                     "note": r.get("note","")} for r in rows]
+        except Exception:
+            pass
+    # local fallback
     try:
         return json.loads(PORTFOLIO_FILE.read_text()) if PORTFOLIO_FILE.exists() else []
-    except Exception: return []
+    except Exception:
+        return []
 
 def save_portfolio(trades: list):
-    PORTFOLIO_FILE.write_text(json.dumps(trades, indent=2))
+    """Sync all trades to Supabase (full replace) and keep local JSON as backup."""
+    sb = _get_sb()
+    if sb:
+        try:
+            # Delete all existing rows then re-insert (simple full-sync for a small personal list)
+            existing = sb.table("portfolio_trades").select("id").execute().data or []
+            if existing:
+                ids = [r["id"] for r in existing]
+                sb.table("portfolio_trades").delete().in_("id", ids).execute()
+            if trades:
+                rows = [{"id": t.get("id", str(dt.datetime.now().timestamp())),
+                         "ticker": t["ticker"], "date_bought": t["date"],
+                         "amount_usd": float(t["amount"]), "note": t.get("note","")}
+                        for t in trades]
+                sb.table("portfolio_trades").insert(rows).execute()
+        except Exception:
+            pass
+    # always write local backup too
+    try:
+        PORTFOLIO_FILE.write_text(json.dumps(trades, indent=2))
+    except Exception:
+        pass
 
 def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
     rows = []
