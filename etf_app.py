@@ -438,7 +438,7 @@ with st.sidebar:
             st.session_state.ai_key = ""; st.rerun()
     st.markdown("---")
     new_tk = st.text_input("Add any ticker:", placeholder="JEPI, COIN, SPLG…")
-    if st.button("➕ Add", width='stretch') and new_tk:
+    if st.button("➕ Add", use_container_width=True) and new_tk:
         info = validate_ticker(new_tk)
         if info is None: st.error(f"'{new_tk.upper()}' not found on Yahoo Finance.")
         elif info["ticker"] in st.session_state.selected: st.info("Already added.")
@@ -657,7 +657,7 @@ with tab_pf:
                 pf_am = st.number_input("$ Amount", min_value=1.0, value=100.0, step=10.0)
             with fc4:
                 pf_nt = st.text_input("Note (optional)", placeholder="First buy, DCA, etc.")
-            submitted = st.form_submit_button("Record investment", width='stretch')
+            submitted = st.form_submit_button("Record investment", use_container_width=True)
             if submitted and pf_tk:
                 tk_up = pf_tk.strip().upper()
                 trades.append({"id": str(dt.datetime.now().timestamp()),
