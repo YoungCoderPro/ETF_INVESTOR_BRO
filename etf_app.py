@@ -377,7 +377,7 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
 
 # ================================================================ UI SETUP
 
-_app_icon = _PIL_Image.open(Path(__file__).parent / "app.png")
+_app_icon = _PIL_Image.open(Path(__file__).parent / "icon.png")
 st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
 st.markdown("""
