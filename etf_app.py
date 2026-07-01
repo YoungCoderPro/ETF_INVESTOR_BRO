@@ -548,6 +548,63 @@ def save_targets(targets: dict):
     try: TARGETS_FILE.write_text(json.dumps(targets, indent=2))
     except Exception: pass
 
+# ================================================================ AI CONVERSATION PERSISTENCE
+
+def save_conversation(conv_id: str, title: str, messages: list):
+    """Upsert a conversation to Supabase."""
+    sb = _get_sb()
+    if sb:
+        try:
+            sb.table("ai_conversations").upsert({
+                "id": conv_id, "title": title, "messages": messages,
+                "updated_at": dt.datetime.utcnow().isoformat()
+            }).execute()
+        except Exception: pass
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_past_conversations() -> list:
+    """Load past conversations from Supabase, newest first."""
+    sb = _get_sb()
+    if sb:
+        try:
+            res = (sb.table("ai_conversations")
+                   .select("id,title,created_at,updated_at,messages")
+                   .order("updated_at", desc=True)
+                   .limit(25)
+                   .execute())
+            return res.data or []
+        except Exception: pass
+    return []
+
+def delete_conversation(conv_id: str):
+    sb = _get_sb()
+    if sb:
+        try: sb.table("ai_conversations").delete().eq("id", conv_id).execute()
+        except Exception: pass
+
+def build_memory_context(current_conv_id: str) -> str:
+    """
+    Extract the most recent advisor exchanges from past conversations
+    and inject them as memory so Claude knows what it said before.
+    Only pulls the first user question + first assistant reply from
+    each of the last 4 conversations (keeps tokens low).
+    """
+    past = load_past_conversations()
+    past = [c for c in past if c.get("id") != current_conv_id]
+    if not past: return ""
+    lines = ["MEMORY FROM PRIOR CONVERSATIONS (what the user asked and what you said):"]
+    for conv in past[:4]:
+        msgs = conv.get("messages", [])
+        date = (conv.get("updated_at") or conv.get("created_at",""))[:10]
+        user_q  = next((m["content"][:200] for m in msgs if m.get("role")=="user"), None)
+        ai_resp = next((m["content"][:300] for m in msgs if m.get("role")=="assistant"), None)
+        if user_q:
+            lines.append(f"\n[{date}] User asked: \"{user_q}\"")
+        if ai_resp:
+            lines.append(f"You responded: \"{ai_resp}...\"")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for trade in trades:
@@ -623,7 +680,10 @@ section[data-testid="stSidebar"]{{background:{T['bg2']};border-right:1px solid {
 
 # ================================================================ SESSION STATE
 for k, v in [("selected",list(OWNED)),("selected_etf",None),
-              ("ai_key",""),("ai_messages",[]),("show_overlap",False)]:
+              ("ai_key",""),("ai_messages",[]),("show_overlap",False),
+              ("conv_id", str(dt.datetime.now().timestamp())),
+              ("conv_title", "New conversation"),
+              ("viewing_past", None)]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ================================================================ SIDEBAR
@@ -1336,12 +1396,73 @@ with tab_pulse:
 
 # ================================================================ TAB 4: AI ADVISOR
 with tab_ai:
-    st.markdown('<div class="lbl">AI Investment Advisor \u2014 knows your portfolio, market data, and 70+ ETFs</div>',
+    st.markdown('<div class="lbl">AI Investment Advisor — knows your portfolio, market data, and 70+ ETFs</div>',
                 unsafe_allow_html=True)
     ai_key = st.session_state.get("ai_key","")
     if not ai_key:
         st.info("Enter your Anthropic API key in the sidebar. Get one free at console.anthropic.com.")
     else:
+        # ---- Past Conversations panel ----
+        with st.expander("📚 Past Conversations", expanded=False):
+            load_past_conversations.clear()
+            past_convs = load_past_conversations()
+            sb_ready   = _get_sb() is not None
+            if not sb_ready:
+                st.caption("Connect Supabase (SUPABASE_URL + SUPABASE_KEY in Streamlit secrets) to persist conversations.")
+            elif not past_convs:
+                st.caption("No saved conversations yet. Start chatting and your history will appear here.")
+            else:
+                for conv in past_convs:
+                    date     = (conv.get("updated_at") or conv.get("created_at",""))[:10]
+                    title    = conv.get("title","Untitled")[:55]
+                    msg_cnt  = len(conv.get("messages",[]))
+                    pc1, pc2, pc3 = st.columns([3, 1, 1])
+                    with pc1:
+                        if st.button(f"{date} — {title} ({msg_cnt} msgs)",
+                                     key=f"view_{conv['id']}", help="Click to view"):
+                            st.session_state.ai_messages  = conv.get("messages", [])
+                            st.session_state.conv_id      = conv["id"]
+                            st.session_state.conv_title   = conv.get("title","Untitled")
+                            st.session_state.viewing_past = conv["id"]
+                            st.rerun()
+                    with pc2:
+                        if st.button("Continue", key=f"cont_{conv['id']}"):
+                            st.session_state.ai_messages  = conv.get("messages", [])
+                            st.session_state.conv_id      = conv["id"]
+                            st.session_state.conv_title   = conv.get("title","Untitled")
+                            st.session_state.viewing_past = None
+                            st.rerun()
+                    with pc3:
+                        if st.button("🗑", key=f"del_{conv['id']}", help="Delete"):
+                            delete_conversation(conv["id"])
+                            if st.session_state.conv_id == conv["id"]:
+                                st.session_state.ai_messages  = []
+                                st.session_state.conv_id      = str(dt.datetime.now().timestamp())
+                                st.session_state.conv_title   = "New conversation"
+                            st.rerun()
+
+        # ---- New chat button ----
+        nc1, nc2 = st.columns([1, 4])
+        with nc1:
+            if st.button("🆕 New chat", use_container_width=True):
+                if st.session_state.ai_messages:
+                    save_conversation(st.session_state.conv_id,
+                                      st.session_state.conv_title,
+                                      st.session_state.ai_messages)
+                st.session_state.ai_messages  = []
+                st.session_state.conv_id      = str(dt.datetime.now().timestamp())
+                st.session_state.conv_title   = "New conversation"
+                st.session_state.viewing_past = None
+                st.rerun()
+        with nc2:
+            if st.session_state.ai_messages:
+                st.markdown(f'<div style="color:{T["text2"]};font-size:12px;padding-top:8px;">'
+                            f'💬 <b>{st.session_state.conv_title}</b> '
+                            f'({len(st.session_state.ai_messages)} messages)</div>',
+                            unsafe_allow_html=True)
+        st.divider()
+
+        # ---- Build context ----
         dfm_ai    = compute_metrics(prices, "VOO")
         sigs_ai   = compute_signals(prices[[t for t in sel if t in prices.columns]])
         trades_ai = load_portfolio()
@@ -1351,72 +1472,54 @@ with tab_ai:
 
         pf_sum = "No investments recorded yet."
         if not pnl_ai.empty:
-            ti   = pnl_ai["Invested $"].sum()
-            tc   = pnl_ai["Cur. Value $"].sum()
+            ti  = pnl_ai["Invested $"].sum()
+            tc  = pnl_ai["Cur. Value $"].sum()
             pf_sum = (f"Total invested: ${ti:,.0f}, current value: ${tc:,.0f}, "
                       f"gain: ${tc-ti:+,.0f} ({(tc/ti-1)*100:+.1f}%)\n"
                       + "\n".join(f"  {r['Ticker']}: invested ${r['Invested $']:.0f}, "
-                                  f"now ${r['Cur. Value $']:.0f} ({r['Return %']:+.1f}%, "
-                                  f"ann {r['Ann. %']:+.1f}%)"
-                                  for _, r in pnl_ai.iterrows()))
+                                   f"now ${r['Cur. Value $']:.0f} ({r['Return %']:+.1f}%, ann {r['Ann. %']:+.1f}%)"
+                                   for _, r in pnl_ai.iterrows()))
 
         m_snap = []
         for _, r in dfm_ai.iterrows():
             t   = r["Ticker"]
-            sig = sigs_ai.get(t,{})
+            sig = sigs_ai.get(t, {})
             m_snap.append(
                 f"  {t} ({'HELD' if t in OWNED else 'watchlist'}): "
                 f"${r['Price']:.2f}, 1Y {r['1Y TR %']:+.1f}%, 5Y {r['5Y Ann %']:+.1f}%/yr, "
                 f"Sharpe {r['Sharpe']:.2f}, MaxDD {r['Max DD %']:.0f}%, "
-                f"Corr\u2192VOO {r['Corr\u2192VOO']:.2f}"
+                f"Corr→VOO {r['Corr→VOO']:.2f}"
                 + (f", RSI {sig['rsi']}" if sig else "")
-                + (", Golden X" if sig.get("golden") else ", Death X" if sig.get("golden") is False else ""))
+                + (", Golden X" if sig.get("golden") else
+                   ", Death X" if sig.get("golden") is False else ""))
 
         top_opp = dfm_ai[~dfm_ai["Ticker"].isin(OWNED)].dropna(subset=["Sharpe"]).nlargest(5,"Sharpe")
-        opp_l   = [f"  {r['Ticker']} ({r['Category']}): 5Y {r['5Y Ann %']:+.1f}%/yr, "
-                   f"Sharpe {r['Sharpe']:.2f}, MaxDD {r['Max DD %']:.0f}%"
+        opp_l   = [f"  {r['Ticker']} ({r['Category']}): 5Y {r['5Y Ann %']:+.1f}%/yr, Sharpe {r['Sharpe']:.2f}"
                    for _, r in top_opp.iterrows()]
-
-        macro_str = "\n".join(f"  {k}: {v['current']} ({v['chg_1m']:+.1f}% 1M)"
-                              if v.get("chg_1m") is not None else f"  {k}: {v['current']}"
-                              for k,v in macro_ai.items()) if macro_ai else "unavailable"
-
+        macro_str = ", ".join(f"{k}={v['current']}" for k,v in macro_ai.items()) if macro_ai else "unavailable"
         held_cats   = set(CATALOG.get(t,{}).get("cat","") for t in OWNED)
-        all_cats    = {"core","growth","tech","semis","dividend","value","factor",
-                       "sector","intl","smallmid","realasset","bond","thematic"}
+        all_cats    = {"core","growth","tech","semis","dividend","value","factor","sector","intl","smallmid","realasset","bond","thematic"}
         missing_str = ", ".join(CAT_LABEL.get(c,c) for c in all_cats-held_cats)
+        memory_ctx  = build_memory_context(st.session_state.conv_id)
 
-        sys_prompt = f"""You are an expert ETF investment advisor for a 20-year-old F-1 visa student
-with a 30-40 year investing horizon. You have access to real-time data below.
+        sys_prompt = (
+            "You are an expert ETF investment advisor for a 20-year-old F-1 visa student "
+            "with a 30-40 year investing horizon. You have real-time data and memory of prior conversations.\n\n"
+            "PHILOSOPHY: Long-term buy-and-hold. VOO ~50%. Moderate-high risk. Never sells.\n\n"
+            f"HELD ETFs: {', '.join(OWNED)}\n"
+            f"PORTFOLIO P&L:\n{pf_sum}\n\n"
+            f"CURRENT METRICS:\n" + "\n".join(m_snap) + "\n\n"
+            f"MARKET SENTIMENT: {fg_ai['value']}/100 \u2014 {fg_ai['label']}\n"
+            f"MACRO: {macro_str}\n\n"
+            f"TOP NON-HELD OPPS:\n" + "\n".join(opp_l) + "\n\n"
+            f"MISSING CATEGORIES: {missing_str}\n\n"
+            f"{memory_ctx}\n\n"
+            "INSTRUCTIONS: Be direct, data-backed, beginner-friendly. Give real tickers. "
+            "Reference prior conversations naturally when relevant. "
+            "You are not a licensed financial advisor."
+        )
 
-INVESTMENT PHILOSOPHY: Long-term buy-and-hold. VOO always ~50% of portfolio.
-Wants growth + diversification. Moderate-high risk tolerance. Never sells — only buys more.
-
-HELD ETFs: {', '.join(OWNED)}
-PORTFOLIO P&L:
-{pf_sum}
-
-CURRENT METRICS (ALL SELECTED ETFs):
-{chr(10).join(m_snap)}
-
-MARKET SENTIMENT: {fg_ai['value']}/100 — {fg_ai['label']}
-MACRO CONTEXT:
-{macro_str}
-
-TOP NON-HELD OPPORTUNITIES (by Sharpe):
-{chr(10).join(opp_l)}
-
-MISSING PORTFOLIO CATEGORIES: {missing_str}
-
-INSTRUCTIONS:
-- Be direct, specific, data-backed. Give real ticker recommendations with reasoning.
-- Reference actual numbers from above. Explain simply (they are a beginner).
-- Consider the macro context when giving advice (e.g. high rates = growth headwind).
-- For "what to invest in", weigh: Sharpe ratio, diversification gap, market sentiment,
-  correlation to existing holdings, long-term compounding.
-- You are not a licensed financial advisor — say so when giving specific allocations.
-- Keep answers focused and actionable."""
-
+        # ---- Starter questions ----
         if not st.session_state.ai_messages:
             st.markdown(f'<div style="font-size:11.5px;color:{T["text2"]};margin-bottom:10px;">Suggested questions:</div>',
                         unsafe_allow_html=True)
@@ -1432,45 +1535,57 @@ INSTRUCTIONS:
             for i, q in enumerate(starters):
                 with sc[i%2]:
                     if st.button(q, key=f"s_{i}"):
+                        st.session_state.conv_title = q[:60]
                         st.session_state.ai_messages.append({"role":"user","content":q})
                         st.rerun()
 
+        # ---- Render messages ----
         for msg in st.session_state.ai_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        if prompt := st.chat_input("Ask about your portfolio, ETFs, macro, what to buy\u2026"):
+        # ---- Chat input ----
+        if prompt := st.chat_input("Ask about your portfolio, ETFs, macro, what to buy…"):
+            if not st.session_state.ai_messages:
+                st.session_state.conv_title = prompt[:60]
             st.session_state.ai_messages.append({"role":"user","content":prompt})
             with st.chat_message("user"): st.markdown(prompt)
             with st.chat_message("assistant"):
                 try:
                     import anthropic as _ant
                     client    = _ant.Anthropic(api_key=ai_key)
-                    history   = st.session_state.ai_messages[-12:]
                     holder    = st.empty()
                     full_resp = ""
-                    with client.messages.stream(model="claude-sonnet-4-6", max_tokens=1400,
+                    with client.messages.stream(
+                        model="claude-sonnet-4-6", max_tokens=1400,
                         system=sys_prompt,
-                        messages=[{"role":m["role"],"content":m["content"]} for m in history]) as stream:
+                        messages=[{"role":m["role"],"content":m["content"]}
+                                  for m in st.session_state.ai_messages[-14:]]
+                    ) as stream:
                         for chunk in stream.text_stream:
                             full_resp += chunk
-                            holder.markdown(full_resp+"\u25cc")
+                            holder.markdown(full_resp+"◌")
                     holder.markdown(full_resp)
                     st.session_state.ai_messages.append({"role":"assistant","content":full_resp})
+                    save_conversation(st.session_state.conv_id,
+                                      st.session_state.conv_title,
+                                      st.session_state.ai_messages)
+                    load_past_conversations.clear()
                 except ImportError:
                     st.error("Run: pip install anthropic")
                 except Exception as e:
                     err = str(e)
-                    if "invalid_api_key" in err.lower() or "authentication" in err.lower():
-                        st.error("Invalid API key \u2014 check in the sidebar.")
+                    if "credit" in err.lower() or "balance" in err.lower():
+                        st.error("Out of Anthropic credits. Go to console.anthropic.com → Plans & Billing to add credits.")
+                    elif "invalid_api_key" in err.lower() or "authentication" in err.lower():
+                        st.error("Invalid API key — check it in the sidebar.")
                     else:
                         st.error(f"AI error: {err}")
-        if st.session_state.ai_messages:
-            if st.button("\U0001f5d1 Clear conversation"):
-                st.session_state.ai_messages = []; st.rerun()
-        st.markdown(f'<div class="disclaim">AI responses are educational only, not financial advice. '
-                    f'Context includes real-time portfolio P&L, macro data, and market sentiment. '
-                    f'API key stored in browser session only.</div>', unsafe_allow_html=True)
+
+        st.markdown(f'<div class="disclaim">Conversations auto-save to Supabase after each reply. ' +
+                    f'Prior sessions inform AI memory. Educational only, not financial advice.</div>',
+                    unsafe_allow_html=True)
+
 
 # ================================================================ TAB 5: CHART
 with tab_chart:
