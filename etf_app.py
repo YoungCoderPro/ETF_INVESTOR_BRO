@@ -380,6 +380,10 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
 _app_icon = _PIL_Image.open(Path(__file__).parent / "app.png")
 st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
+st.markdown("""
+<link rel="apple-touch-icon" href="https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png">
+<link rel="shortcut icon" href="https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png">
+""", unsafe_allow_html=True)
 
 THEME = dict(bg="#0d1f2d", bg2="#132233", bg3="#1f3b4d",
              gold="#d4af37", orange="#f5900a",
