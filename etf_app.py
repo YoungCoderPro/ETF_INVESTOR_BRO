@@ -13,6 +13,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from pathlib import Path
 import yfinance as yf
+from PIL import Image as _PIL_Image
 
 # ================================================================ CONSTANTS
 OWNED   = ["VOO", "VGT", "SMH", "VXUS", "SCHG"]
@@ -94,6 +95,7 @@ CATALOG = {
     "JEPI":dict(name="JPMorgan Equity Premium Income",cat="dividend",role="Covered-Call Income",er=0.35),
     "JEPQ":dict(name="JPMorgan Nasdaq Equity Premium",cat="dividend",role="Covered-Call Income",er=0.35),
 }
+
 CAT_LABEL = {"core":"US Core","growth":"Growth","tech":"Tech","semis":"Semis",
     "dividend":"Dividend","value":"Value","factor":"Factor","sector":"Sector",
     "intl":"International","smallmid":"Small/Mid","realasset":"Real Asset",
@@ -374,7 +376,9 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 # ================================================================ UI SETUP
-st.set_page_config(page_title="ETF Command Center", layout="wide", page_icon="📈",
+
+_app_icon = _PIL_Image.open(Path(__file__).parent / "app.png")
+st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
 
 THEME = dict(bg="#0d1f2d", bg2="#132233", bg3="#1f3b4d",
