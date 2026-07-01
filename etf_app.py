@@ -103,7 +103,6 @@ MEGACAP_WATCH = ["NVDA","AAPL","MSFT","AMZN","GOOGL","META","TSLA"]
 RANGES = {"1D":("intraday","1d","5m"),"1W":("intraday","5d","15m"),
           "1M":("daily",30,None),"1Y":("daily",365,None),
           "3Y":("daily",3*365,None),"5Y":("daily",5*365,None),"10Y/MAX":("daily",10*365,None)}
-_GH = "https://raw.githubusercontent.com/YoungCoderPro/ETF_INVESTOR_BRO/main"
 
 # ================================================================ DATA LAYER
 
@@ -373,36 +372,6 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
 _app_icon = _PIL_Image.open(Path(__file__).parent / "icon.png")
 st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
-
-# ---- Android home screen icon: JS head injection (replaces Streamlit's manifest) ----
-import json as _json
-_manifest = _json.dumps({
-    "name": "ETF Investor Bro", "short_name": "ETF Bro",
-    "description": "Personal ETF investing dashboard",
-    "start_url": ".", "display": "standalone",
-    "background_color": "#0d1f2d", "theme_color": "#d4af37",
-    "icons": [
-        {"src": f"{_GH}/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
-        {"src": f"{_GH}/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"}
-    ]
-})
-st.markdown(f"""<script>
-(function(){{
-  var gh='{_GH}';
-  var ati=document.querySelector('link[rel="apple-touch-icon"]');
-  if(!ati){{ati=document.createElement('link');ati.rel='apple-touch-icon';document.head.appendChild(ati);}}
-  ati.href=gh+'/icon.png';
-  var wac=document.querySelector('meta[name="mobile-web-app-capable"]');
-  if(!wac){{wac=document.createElement('meta');wac.name='mobile-web-app-capable';document.head.appendChild(wac);}}
-  wac.content='yes';
-  var tc=document.querySelector('meta[name="theme-color"]');
-  if(!tc){{tc=document.createElement('meta');tc.name='theme-color';document.head.appendChild(tc);}}
-  tc.content='#d4af37';
-  var mfl=document.querySelector('link[rel="manifest"]');
-  if(mfl){{mfl.href=gh+'/manifest.json';}}
-  else{{var e=document.createElement('link');e.rel='manifest';e.href=gh+'/manifest.json';document.head.appendChild(e);}}
-}})();
-</script>""", unsafe_allow_html=True)
 
 THEME = dict(bg="#0d1f2d", bg2="#132233", bg3="#1f3b4d",
              gold="#d4af37", orange="#f5900a",
