@@ -516,9 +516,15 @@ with st.spinner(f"Fetching live total-return data for {len(sel)} ETFs…"):
         st.error(f"Data fetch failed: {e}"); st.stop()
 
 # ================================================================ MASTHEAD + TAPE
-icon_url = "https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png"
+icon_url = "https://raw.githubusercontent.com/YoungCoderPro/ETF_INVESTOR_BRO/main/icon.png"
+
+import base64
+_icon_path = Path(__file__).parent / "icon.png"
+_icon_b64 = base64.b64encode(_icon_path.read_bytes()).decode() if _icon_path.exists() else ""
+_icon_src = f"data:image/png;base64,{_icon_b64}" if _icon_b64 else ""
+
 st.markdown(f'''<div class="masthead" style="align-items:center;gap:16px;">
-  <img src="{icon_url}" style="width:54px;height:54px;border-radius:10px;flex-shrink:0;">
+  {"<img src='" + _icon_src + "' style='width:54px;height:54px;border-radius:10px;flex-shrink:0;'>" if _icon_src else ""}
   <div>
     <h1 style="margin:0;">ETF INVESTOR BRO</h1>
     <span class="tag">Live Total-Return Terminal &middot; Dividends Reinvested &middot; {dt.date.today()}</span>
