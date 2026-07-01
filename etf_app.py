@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- ETF COMMAND CENTER v3  —  personal investing dashboard
+ ETF INVESTOR BRO  —  personal investing dashboard
 ================================================================================
  Run:    python -m streamlit run etf_app.py
  Mobile: open http://<your-network-url>:8501 on any device on the same WiFi
  Deploy: push to GitHub -> share.streamlit.io (free public URL, no VS Code needed)
 ================================================================================
 """
-import datetime as dt, json, os, numpy as np, pandas as pd
+import datetime as dt, json, os, numpy as np, pandas as pd, base64
 import streamlit as st
 import plotly.graph_objects as go
 from pathlib import Path
@@ -95,7 +95,6 @@ CATALOG = {
     "JEPI":dict(name="JPMorgan Equity Premium Income",cat="dividend",role="Covered-Call Income",er=0.35),
     "JEPQ":dict(name="JPMorgan Nasdaq Equity Premium",cat="dividend",role="Covered-Call Income",er=0.35),
 }
-
 CAT_LABEL = {"core":"US Core","growth":"Growth","tech":"Tech","semis":"Semis",
     "dividend":"Dividend","value":"Value","factor":"Factor","sector":"Sector",
     "intl":"International","smallmid":"Small/Mid","realasset":"Real Asset",
@@ -104,6 +103,7 @@ MEGACAP_WATCH = ["NVDA","AAPL","MSFT","AMZN","GOOGL","META","TSLA"]
 RANGES = {"1D":("intraday","1d","5m"),"1W":("intraday","5d","15m"),
           "1M":("daily",30,None),"1Y":("daily",365,None),
           "3Y":("daily",3*365,None),"5Y":("daily",5*365,None),"10Y/MAX":("daily",10*365,None)}
+_GH = "https://raw.githubusercontent.com/YoungCoderPro/ETF_INVESTOR_BRO/main"
 
 # ================================================================ DATA LAYER
 
@@ -163,7 +163,7 @@ def compute_metrics(prices: pd.DataFrame, bench: str = "VOO") -> pd.DataFrame:
                "Sharpe": round((cagr-RF)/vol, 2) if vol > 0 else np.nan,
                "Sortino": round((cagr-RF)/down, 2) if down > 0 else np.nan,
                "Max DD %": round(mdd*100,1),
-               "Corr→VOO": round(corr,2) if pd.notna(corr) else np.nan,
+               "Corr\u2192VOO": round(corr,2) if pd.notna(corr) else np.nan,
                "vs S&P 5Y": round(y5-bench_y5,1) if pd.notna(y5) and pd.notna(bench_y5) else np.nan}))
     return pd.DataFrame(rows)
 
@@ -179,23 +179,23 @@ def compute_signals(prices: pd.DataFrame) -> dict:
     for t in prices.columns:
         s = prices[t].dropna()
         if len(s) < 55: continue
-        rsi     = compute_rsi(s)
-        ma50    = s.rolling(50).mean()
-        ma200   = s.rolling(200).mean() if len(s) >= 200 else None
-        price   = float(s.iloc[-1])
-        hi52    = float(s[-252:].max()) if len(s)>=252 else float(s.max())
-        lo52    = float(s[-252:].min()) if len(s)>=252 else float(s.min())
-        golden  = bool(float(ma50.iloc[-1]) > float(ma200.iloc[-1])) if ma200 is not None else None
-        ret_1m  = (s.iloc[-1]/s.iloc[-22]-1)*100 if len(s)>=22 else np.nan
-        ret_3m  = (s.iloc[-1]/s.iloc[-66]-1)*100 if len(s)>=66 else np.nan
-        out[t]  = dict(rsi=round(float(rsi.iloc[-1]),1), price=price,
-                       ma50=round(float(ma50.iloc[-1]),2),
-                       ma200=round(float(ma200.iloc[-1]),2) if ma200 is not None else None,
-                       hi52=hi52, lo52=lo52,
-                       pct_from_hi=round((price-hi52)/hi52*100,1),
-                       pct_from_lo=round((price-lo52)/lo52*100,1),
-                       golden=golden, ret_1m=round(float(ret_1m),1),
-                       ret_3m=round(float(ret_3m),1))
+        rsi    = compute_rsi(s)
+        ma50   = s.rolling(50).mean()
+        ma200  = s.rolling(200).mean() if len(s) >= 200 else None
+        price  = float(s.iloc[-1])
+        hi52   = float(s[-252:].max()) if len(s)>=252 else float(s.max())
+        lo52   = float(s[-252:].min()) if len(s)>=252 else float(s.min())
+        golden = bool(float(ma50.iloc[-1]) > float(ma200.iloc[-1])) if ma200 is not None else None
+        ret_1m = (s.iloc[-1]/s.iloc[-22]-1)*100 if len(s)>=22 else np.nan
+        ret_3m = (s.iloc[-1]/s.iloc[-66]-1)*100 if len(s)>=66 else np.nan
+        out[t] = dict(rsi=round(float(rsi.iloc[-1]),1), price=price,
+                      ma50=round(float(ma50.iloc[-1]),2),
+                      ma200=round(float(ma200.iloc[-1]),2) if ma200 is not None else None,
+                      hi52=hi52, lo52=lo52,
+                      pct_from_hi=round((price-hi52)/hi52*100,1),
+                      pct_from_lo=round((price-lo52)/lo52*100,1),
+                      golden=golden, ret_1m=round(float(ret_1m),1),
+                      ret_3m=round(float(ret_3m),1))
     return out
 
 @st.cache_data(ttl=60*60, show_spinner=False)
@@ -291,7 +291,6 @@ def monte_carlo(s: pd.Series, n_years=10, n_paths=2000, monthly_add=100.0) -> di
 # ================================================================ PORTFOLIO — SUPABASE + LOCAL FALLBACK
 
 def _get_sb():
-    """Return a Supabase client if credentials are configured, else None."""
     try:
         from supabase import create_client
         url = (st.secrets.get("SUPABASE_URL","") if hasattr(st,"secrets") else "") \
@@ -305,7 +304,6 @@ def _get_sb():
     return None
 
 def load_portfolio() -> list:
-    """Load trades from Supabase if available, else local JSON."""
     sb = _get_sb()
     if sb:
         try:
@@ -315,18 +313,15 @@ def load_portfolio() -> list:
                      "note": r.get("note","")} for r in rows]
         except Exception:
             pass
-    # local fallback
     try:
         return json.loads(PORTFOLIO_FILE.read_text()) if PORTFOLIO_FILE.exists() else []
     except Exception:
         return []
 
 def save_portfolio(trades: list):
-    """Sync all trades to Supabase (full replace) and keep local JSON as backup."""
     sb = _get_sb()
     if sb:
         try:
-            # Delete all existing rows then re-insert (simple full-sync for a small personal list)
             existing = sb.table("portfolio_trades").select("id").execute().data or []
             if existing:
                 ids = [r["id"] for r in existing]
@@ -339,7 +334,6 @@ def save_portfolio(trades: list):
                 sb.table("portfolio_trades").insert(rows).execute()
         except Exception:
             pass
-    # always write local backup too
     try:
         PORTFOLIO_FILE.write_text(json.dumps(trades, indent=2))
     except Exception:
@@ -362,7 +356,7 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
         days    = max((pd.Timestamp.today() - buy_dt).days, 1)
         try:
             if days < 14:
-                ann = pct           # too early to annualize meaningfully
+                ann = pct
             else:
                 raw = (curr_v / amount) ** (365.0 / days) - 1
                 ann = float(np.clip(raw * 100, -99.9, 50000.0))
@@ -376,11 +370,39 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 # ================================================================ UI SETUP
-
 _app_icon = _PIL_Image.open(Path(__file__).parent / "icon.png")
 st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
 
+# ---- Android home screen icon: JS head injection (replaces Streamlit's manifest) ----
+import json as _json
+_manifest = _json.dumps({
+    "name": "ETF Investor Bro", "short_name": "ETF Bro",
+    "description": "Personal ETF investing dashboard",
+    "start_url": ".", "display": "standalone",
+    "background_color": "#0d1f2d", "theme_color": "#d4af37",
+    "icons": [
+        {"src": f"{_GH}/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        {"src": f"{_GH}/icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"}
+    ]
+})
+st.markdown(f"""<script>
+(function(){{
+  var gh='{_GH}';
+  var ati=document.querySelector('link[rel="apple-touch-icon"]');
+  if(!ati){{ati=document.createElement('link');ati.rel='apple-touch-icon';document.head.appendChild(ati);}}
+  ati.href=gh+'/icon.png';
+  var wac=document.querySelector('meta[name="mobile-web-app-capable"]');
+  if(!wac){{wac=document.createElement('meta');wac.name='mobile-web-app-capable';document.head.appendChild(wac);}}
+  wac.content='yes';
+  var tc=document.querySelector('meta[name="theme-color"]');
+  if(!tc){{tc=document.createElement('meta');tc.name='theme-color';document.head.appendChild(tc);}}
+  tc.content='#d4af37';
+  var mfl=document.querySelector('link[rel="manifest"]');
+  if(mfl){{mfl.href=gh+'/manifest.json';}}
+  else{{var e=document.createElement('link');e.rel='manifest';e.href=gh+'/manifest.json';document.head.appendChild(e);}}
+}})();
+</script>""", unsafe_allow_html=True)
 
 THEME = dict(bg="#0d1f2d", bg2="#132233", bg3="#1f3b4d",
              gold="#d4af37", orange="#f5900a",
@@ -393,7 +415,7 @@ st.markdown(f"""
 html,body,[class*="css"]{{font-family:'Roboto Mono',monospace;}}
 .stApp{{background:{THEME['bg']} !important;}}
 section[data-testid="stSidebar"]{{background:{THEME['bg2']};border-right:1px solid {THEME['bg3']};}}
-.masthead{{display:flex;align-items:baseline;gap:14px;border-bottom:2px solid {THEME['gold']};
+.masthead{{display:flex;align-items:center;gap:16px;border-bottom:2px solid {THEME['gold']};
   padding-bottom:10px;margin-bottom:6px;}}
 .masthead h1{{font-family:Oswald,sans-serif;font-weight:700;font-size:28px;letter-spacing:1px;
   color:{THEME['text']};margin:0;text-transform:uppercase;}}
@@ -432,8 +454,6 @@ section[data-testid="stSidebar"]{{background:{THEME['bg2']};border-right:1px sol
 .news-tk{{font-size:10px;font-weight:700;color:{THEME['gold']};}}
 .news-title{{font-size:13px;color:{THEME['text']};line-height:1.4;}}
 .news-meta{{font-size:10.5px;color:{THEME['text3']};margin-top:3px;}}
-.pf-pos{{color:{THEME['green']};font-weight:600;}}
-.pf-neg{{color:{THEME['red']};font-weight:600;}}
 .suggest-card{{background:{THEME['bg3']};border:1px solid {THEME['gold']};border-radius:8px;
   padding:14px 16px;text-align:center;}}
 .suggest-tk{{font-family:Oswald;font-size:20px;font-weight:700;color:{THEME['gold']};}}
@@ -444,7 +464,7 @@ section[data-testid="stSidebar"]{{background:{THEME['bg2']};border-right:1px sol
 </style>""", unsafe_allow_html=True)
 
 # ================================================================ SESSION STATE
-for k, v in [("selected", list(OWNED)), ("selected_etf", None)]:
+for k, v in [("selected", list(OWNED)), ("selected_etf", None), ("ai_key", ""), ("ai_messages", [])]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -469,10 +489,9 @@ with st.sidebar:
         to_rem = st.multiselect("Remove watchlist:", removable)
         st.session_state.selected = [t for t in st.session_state.selected if t not in to_rem]
     st.markdown("---")
-    # ---- AI key (used by AI Advisor tab) ----
     ai_key_default = (st.secrets.get("ANTHROPIC_KEY","") if hasattr(st,"secrets") else
                       os.environ.get("ANTHROPIC_KEY",""))
-    if "ai_key" not in st.session_state:
+    if not st.session_state.ai_key and ai_key_default:
         st.session_state.ai_key = ai_key_default
     if not st.session_state.ai_key:
         st.markdown(f'<div style="font-size:10.5px;color:{THEME["gold"]};">🤖 AI Advisor key</div>',
@@ -516,15 +535,13 @@ with st.spinner(f"Fetching live total-return data for {len(sel)} ETFs…"):
         st.error(f"Data fetch failed: {e}"); st.stop()
 
 # ================================================================ MASTHEAD + TAPE
-icon_url = "https://raw.githubusercontent.com/YoungCoderPro/ETF_INVESTOR_BRO/main/icon.png"
-
-import base64
 _icon_path = Path(__file__).parent / "icon.png"
-_icon_b64 = base64.b64encode(_icon_path.read_bytes()).decode() if _icon_path.exists() else ""
-_icon_src = f"data:image/png;base64,{_icon_b64}" if _icon_b64 else ""
+_icon_b64  = base64.b64encode(_icon_path.read_bytes()).decode() if _icon_path.exists() else ""
+_icon_src  = f"data:image/png;base64,{_icon_b64}" if _icon_b64 else ""
+_img_tag   = f"<img src='{_icon_src}' style='width:54px;height:54px;border-radius:10px;flex-shrink:0;'>" if _icon_src else ""
 
-st.markdown(f'''<div class="masthead" style="align-items:center;gap:16px;">
-  {"<img src='" + _icon_src + "' style='width:54px;height:54px;border-radius:10px;flex-shrink:0;'>" if _icon_src else ""}
+st.markdown(f'''<div class="masthead">
+  {_img_tag}
   <div>
     <h1 style="margin:0;">ETF INVESTOR BRO</h1>
     <span class="tag">Live Total-Return Terminal &middot; Dividends Reinvested &middot; {dt.date.today()}</span>
@@ -560,7 +577,6 @@ with tab_board:
         cls, sign = ("up", "+") if v >= 0 else ("dn", "")
         return f'<span class="{cls}">{sign}{v:.{dp}f}{suffix}</span>'
 
-
     rows_html2 = ""
     for _, r in dfm.iterrows():
         held     = r["Ticker"] in OWNED
@@ -589,7 +605,6 @@ with tab_board:
     <tbody>{rows_html2}</tbody></table></div>''', unsafe_allow_html=True)
     st.caption("Total returns (dividends reinvested). †Sharpe = 2% risk-free rate. Past performance ≠ future results.")
 
-    # clickable buttons
     st.markdown('<div class="term-label">Click a ticker for deep dive</div>', unsafe_allow_html=True)
     cols = st.columns(len(sel))
     for i, t in enumerate(sel):
@@ -617,7 +632,7 @@ with tab_board:
             ov = get_fund_overview(pick)
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"##### 📌 Top holdings")
+            st.markdown("##### 📌 Top holdings")
             th = ov["top_holdings"]
             if th is not None and not th.empty:
                 td = th.copy()
@@ -688,7 +703,6 @@ with tab_board:
                         f'Select a ticker above to see top holdings, sector breakdown, and Mag-7 overlap.</div>',
                         unsafe_allow_html=True)
 
-    # concentration donut
     st.markdown('<div class="term-label">Portfolio Concentration</div>', unsafe_allow_html=True)
     cats = {}
     for t in sel:
@@ -712,14 +726,10 @@ with tab_pf:
     with st.expander("➕ Add a new investment", expanded=len(trades)==0):
         with st.form("add_trade", clear_on_submit=True):
             fc1, fc2, fc3, fc4 = st.columns([1,1,1,2])
-            with fc1:
-                pf_tk = st.text_input("Ticker", placeholder="VOO")
-            with fc2:
-                pf_dt = st.date_input("Date bought", value=dt.date.today())
-            with fc3:
-                pf_am = st.number_input("$ Amount", min_value=1.0, value=100.0, step=10.0)
-            with fc4:
-                pf_nt = st.text_input("Note (optional)", placeholder="First buy, DCA, etc.")
+            with fc1: pf_tk = st.text_input("Ticker", placeholder="VOO")
+            with fc2: pf_dt = st.date_input("Date bought", value=dt.date.today())
+            with fc3: pf_am = st.number_input("$ Amount", min_value=1.0, value=100.0, step=10.0)
+            with fc4: pf_nt = st.text_input("Note (optional)", placeholder="First buy, DCA, etc.")
             submitted = st.form_submit_button("Record investment", use_container_width=True)
             if submitted and pf_tk:
                 tk_up = pf_tk.strip().upper()
@@ -734,10 +744,8 @@ with tab_pf:
 
     if trades:
         all_tickers = tuple(set(t["ticker"] for t in trades) | set(sel))
-        try:
-            pf_prices = load_prices(all_tickers)
-        except Exception:
-            pf_prices = prices
+        try: pf_prices = load_prices(all_tickers)
+        except Exception: pf_prices = prices
         pnl_df = compute_pnl(trades, pf_prices)
 
         if not pnl_df.empty:
@@ -745,7 +753,6 @@ with tab_pf:
             total_cur = pnl_df["Cur. Value $"].sum()
             total_g   = total_cur - total_in
             total_pct = total_g / total_in * 100
-
             m1, m2, m3, m4 = st.columns(4)
             def metric_card(col, label, val, sub=None, color=None):
                 sub_html = (f'<div style="font-size:11px;color:{THEME["text3"]};margin-top:2px;">{sub}</div>'
@@ -756,36 +763,30 @@ with tab_pf:
                     f'margin-top:4px;">{val}</div>{sub_html}</div>', unsafe_allow_html=True)
             metric_card(m1, "Total invested",  f"${total_in:,.0f}")
             metric_card(m2, "Current value",   f"${total_cur:,.0f}")
-            metric_card(m3, "Total gain/loss",
-                        f'{"+" if total_g>=0 else ""}${total_g:,.0f}',
+            metric_card(m3, "Total gain/loss", f'{"+" if total_g>=0 else ""}${total_g:,.0f}',
                         color=THEME["green"] if total_g>=0 else THEME["red"])
-            metric_card(m4, "Total return",
-                        f'{"+" if total_pct>=0 else ""}{total_pct:.1f}%',
+            metric_card(m4, "Total return", f'{"+" if total_pct>=0 else ""}{total_pct:.1f}%',
                         color=THEME["green"] if total_pct>=0 else THEME["red"])
 
-            # Styled table
             rows_pf = ""
             for _, r in pnl_df.iterrows():
-                pos   = r["Gain $"] >= 0
-                gc    = THEME["green"] if pos else THEME["red"]
-                sign  = "+" if pos else ""
+                pos  = r["Gain $"] >= 0
+                gc   = THEME["green"] if pos else THEME["red"]
+                sign = "+" if pos else ""
                 rows_pf += (f'<tr><td style="font-weight:700;color:{THEME["text"]};">{r["Ticker"]}</td>'
-                    f'<td>{r["Date"]}</td>'
-                    f'<td>${r["Invested $"]:,.2f}</td>'
+                    f'<td>{r["Date"]}</td><td>${r["Invested $"]:,.2f}</td>'
                     f'<td>${r["Cur. Value $"]:,.2f}</td>'
                     f'<td style="color:{gc};font-weight:600;">{sign}${r["Gain $"]:,.2f}</td>'
                     f'<td style="color:{gc};font-weight:600;">{sign}{r["Return %"]:.1f}%</td>'
                     f'<td style="color:{gc};">{sign}{r["Ann. %"]:.1f}%</td>'
                     f'<td style="color:{THEME["text3"]};">{r["Days"]}d</td>'
-                    f'<td style="color:{THEME["text3"]};font-size:11px;">{r["Note"]}</td>'
-                    f'<td></td></tr>')
+                    f'<td style="color:{THEME["text3"]};font-size:11px;">{r["Note"]}</td></tr>')
             st.markdown(f'''<div style="overflow-x:auto;border:1px solid {THEME["bg3"]};border-radius:6px;margin-top:16px;">
             <table class="board"><thead><tr><th>Ticker</th><th>Date</th><th>Invested</th>
             <th>Value Now</th><th>Gain $</th><th>Return %</th><th>Ann. %</th>
-            <th>Held</th><th>Note</th><th></th></tr></thead>
+            <th>Held</th><th>Note</th></tr></thead>
             <tbody>{rows_pf}</tbody></table></div>''', unsafe_allow_html=True)
 
-            # Per-ticker breakdown bar
             st.markdown('<div class="term-label">Allocation by ticker</div>', unsafe_allow_html=True)
             tk_summary = pnl_df.groupby("Ticker").agg({"Invested $":"sum","Cur. Value $":"sum"}).reset_index()
             bfig = go.Figure()
@@ -798,7 +799,6 @@ with tab_pf:
                 legend=dict(orientation="h", y=-0.2))
             st.plotly_chart(bfig, width='stretch')
 
-            # Delete a trade
             ids = [(f'{r["Ticker"]} {r["Date"]} ${r["Invested $"]:.0f}', r["ID"])
                    for _, r in pnl_df.iterrows()]
             del_label = st.selectbox("Delete a trade:", ["—"] + [i[0] for i in ids])
@@ -810,12 +810,10 @@ with tab_pf:
         else:
             st.info("No price data found for your recorded trades. Check ticker names.")
 
-        # Monte Carlo projections
         st.markdown('<div class="term-label">10-Year Projection (Monte Carlo)</div>', unsafe_allow_html=True)
-        st.caption("Probabilistic simulation based on historical daily volatility — not a forecast. "
-                   "2,000 simulated paths, log-normal returns.")
-        proj_tk  = st.selectbox("Project ticker:", [t for t in sel if t in prices.columns])
-        monthly  = st.number_input("Monthly contribution ($)", min_value=0.0, value=100.0, step=50.0)
+        st.caption("Probabilistic simulation based on historical daily volatility — not a forecast. 2,000 paths.")
+        proj_tk = st.selectbox("Project ticker:", [t for t in sel if t in prices.columns])
+        monthly = st.number_input("Monthly contribution ($)", min_value=0.0, value=100.0, step=50.0)
         if proj_tk and proj_tk in prices.columns:
             mc = monte_carlo(prices[proj_tk].dropna(), n_years=10, n_paths=2000, monthly_add=monthly)
             p1,p2,p3,p4,p5 = st.columns(5)
@@ -827,10 +825,9 @@ with tab_pf:
                 (p5,"Best case\n(90th)",mc["p90"],"#00bfff")]:
                 col.markdown(f'<div class="card" style="text-align:center;">'
                     f'<div style="font-size:10px;color:{THEME["text3"]};">{lbl.replace(chr(10),"<br>")}</div>'
-                    f'<div style="font-size:20px;font-weight:700;color:{clr};margin-top:6px;">'
-                    f'${val:,.0f}</div>'
-                    f'<div style="font-size:10px;color:{THEME["text3"]};margin-top:3px;">'
-                    f'{val/mc["current"]:.1f}× current</div></div>', unsafe_allow_html=True)
+                    f'<div style="font-size:20px;font-weight:700;color:{clr};margin-top:6px;">${val:,.0f}</div>'
+                    f'<div style="font-size:10px;color:{THEME["text3"]};margin-top:3px;">{val/mc["current"]:.1f}× current</div>'
+                    f'</div>', unsafe_allow_html=True)
     else:
         st.info("No investments recorded yet. Use the form above to add your first position.")
 
@@ -847,24 +844,20 @@ with tab_pulse:
             meta = CATALOG.get(tk, dict(name=tk, cat="custom", role="Custom"))
             clr  = THEME["green"] if s_item["ret_1m"]>=0 else THEME["red"]
             with scols[i]:
-                st.markdown(f'<div class="suggest-card">'
-                    f'<div class="suggest-tk">{tk}</div>'
+                st.markdown(f'<div class="suggest-card"><div class="suggest-tk">{tk}</div>'
                     f'<div class="suggest-name">{meta["name"]}</div>'
-                    f'<div class="suggest-ret" style="color:{clr};">'
-                    f'{"+" if s_item["ret_1m"]>=0 else ""}{s_item["ret_1m"]:.1f}% (1M)</div>'
-                    f'<div style="font-size:10px;color:{THEME["text3"]};margin-top:4px;">'
-                    f'Sharpe(3M) {s_item["sharpe_3m"]:.2f}</div></div>', unsafe_allow_html=True)
+                    f'<div class="suggest-ret" style="color:{clr};">{"+" if s_item["ret_1m"]>=0 else ""}{s_item["ret_1m"]:.1f}% (1M)</div>'
+                    f'<div style="font-size:10px;color:{THEME["text3"]};margin-top:4px;">Sharpe(3M) {s_item["sharpe_3m"]:.2f}</div></div>',
+                    unsafe_allow_html=True)
     else:
         st.caption("Could not fetch suggestion data right now.")
-    st.caption("Based on 1-month risk-adjusted return (Sharpe) across the 70+ ETF database. "
-               "Not a recommendation — momentum can reverse.")
+    st.caption("Based on 1-month risk-adjusted return (Sharpe) across the 70+ ETF database. Not a recommendation — momentum can reverse.")
 
-    # Technical signals for held ETFs
     st.markdown('<div class="term-label">Technical Signals — Your Holdings</div>', unsafe_allow_html=True)
     sigs = compute_signals(prices[[t for t in OWNED if t in prices.columns]])
     if sigs:
         for t, sg in sigs.items():
-            rsi    = sg["rsi"]
+            rsi     = sg["rsi"]
             rsi_cls = "signal-bad" if rsi>70 else "signal-ok" if rsi<30 else "signal-warn"
             rsi_lbl = "Overbought" if rsi>70 else "Oversold" if rsi<30 else "Neutral"
             gc_str  = ("✅ Golden cross (MA50>MA200 — bullish)" if sg.get("golden") is True else
@@ -886,27 +879,22 @@ with tab_pulse:
               <div><div style="font-size:10px;color:{THEME["text3"]};">MA50</div>
                 <div style="font-size:14px;color:{THEME["text2"]};">${sg["ma50"]:,.2f}</div></div>
             </div></div>''', unsafe_allow_html=True)
-    st.caption("RSI < 30 = historically oversold / potential buy zone. RSI > 70 = potentially overbought. "
-               "These are technical indicators, not predictions.")
+    st.caption("RSI < 30 = historically oversold. RSI > 70 = potentially overbought. Not predictions.")
 
-    # News
     st.markdown('<div class="term-label">Latest News — Your Holdings</div>', unsafe_allow_html=True)
     with st.spinner("Fetching latest news…"):
         news = get_news(tuple(OWNED))
     if news:
         for art in news:
-            link_html = (f'<a href="{art["url"]}" target="_blank" '
-                         f'style="color:{THEME["text"]};text-decoration:none;">{art["title"]}</a>'
+            link_html = (f'<a href="{art["url"]}" target="_blank" style="color:{THEME["text"]};text-decoration:none;">{art["title"]}</a>'
                          if art.get("url") else art["title"])
-            st.markdown(f'<div class="news-item">'
-                f'<span class="news-tk">{art["ticker"]}</span>'
+            st.markdown(f'<div class="news-item"><span class="news-tk">{art["ticker"]}</span>'
                 f'<div class="news-title">{link_html}</div>'
-                f'<div class="news-meta">{art.get("publisher","")} · {art.get("time","")[:10]}</div>'
-                f'</div>', unsafe_allow_html=True)
+                f'<div class="news-meta">{art.get("publisher","")} · {art.get("time","")[:10]}</div></div>',
+                unsafe_allow_html=True)
     else:
-        st.caption("No news available right now — Yahoo Finance news coverage varies by ETF.")
+        st.caption("No news available right now.")
 
-# ================================================================ TAB 4: CHART
 # ================================================================ TAB 4: AI ADVISOR
 with tab_ai:
     st.markdown('<div class="term-label">AI Investment Advisor</div>', unsafe_allow_html=True)
@@ -914,155 +902,94 @@ with tab_ai:
                 f'Powered by Claude (Anthropic). Knows your portfolio, current metrics, RSI signals, '
                 f'and 70+ ETF performance data. Ask it anything about investing.</div>',
                 unsafe_allow_html=True)
-
     ai_key = st.session_state.get("ai_key","")
     if not ai_key:
         st.info("Enter your Anthropic API key in the sidebar to activate the AI Advisor. "
                 "Get one free at console.anthropic.com — $5 of free credit, more than enough.")
     else:
-        # ---- Build rich context for the AI ----
-        dfm_ai = compute_metrics(prices, "VOO")
-        sigs_ai = compute_signals(prices[[t for t in sel if t in prices.columns]])
+        dfm_ai    = compute_metrics(prices, "VOO")
+        sigs_ai   = compute_signals(prices[[t for t in sel if t in prices.columns]])
         trades_ai = load_portfolio()
         pnl_ai_df = compute_pnl(trades_ai, prices) if trades_ai else pd.DataFrame()
-
-        # Summarise portfolio
         pf_summary = "No investments recorded yet."
         if not pnl_ai_df.empty:
             total_in  = pnl_ai_df["Invested $"].sum()
             total_cur = pnl_ai_df["Cur. Value $"].sum()
-            rows_ai   = []
-            for _, r in pnl_ai_df.iterrows():
-                rows_ai.append(f"  {r['Ticker']}: invested ${r['Invested $']:.0f}, "
-                               f"now ${r['Cur. Value $']:.0f} ({r['Return %']:+.1f}%, "
-                               f"ann {r['Ann. %']:+.1f}%)")
+            rows_ai   = [f"  {r['Ticker']}: invested ${r['Invested $']:.0f}, now ${r['Cur. Value $']:.0f} ({r['Return %']:+.1f}%, ann {r['Ann. %']:+.1f}%)"
+                         for _, r in pnl_ai_df.iterrows()]
             pf_summary = (f"Total invested: ${total_in:,.0f}, current value: ${total_cur:,.0f}, "
                          f"gain: ${total_cur-total_in:+,.0f} ({(total_cur/total_in-1)*100:+.1f}%)\n"
                          + "\n".join(rows_ai))
-
-        # ETF metrics snapshot
         metrics_snap = []
         for _, r in dfm_ai.iterrows():
             t = r["Ticker"]
             sig = sigs_ai.get(t, {})
             rsi_str = f"RSI {sig.get('rsi','?')}" if sig else ""
-            ma_str  = ("Golden cross" if sig.get("golden") else
-                       "Death cross" if sig.get("golden") is False else "") if sig else ""
+            ma_str  = ("Golden cross" if sig.get("golden") else "Death cross" if sig.get("golden") is False else "") if sig else ""
             metrics_snap.append(
                 f"  {t} ({'HELD' if t in OWNED else 'watchlist'}): "
                 f"price ${r['Price']:.2f}, 1Y TR {r['1Y TR %']:+.1f}%, "
                 f"5Y ann {r['5Y Ann %']:+.1f}%, Sharpe {r['Sharpe']:.2f}, "
-                f"MaxDD {r['Max DD %']:.0f}%, Corr→VOO {r['Corr→VOO']:.2f}"
-                + (f", {rsi_str}" if rsi_str else "")
-                + (f", {ma_str}" if ma_str else ""))
+                f"MaxDD {r['Max DD %']:.0f}%, Corr\u2192VOO {r['Corr\u2192VOO']:.2f}"
+                + (f", {rsi_str}" if rsi_str else "") + (f", {ma_str}" if ma_str else ""))
+        top_opp = dfm_ai[~dfm_ai["Ticker"].isin(OWNED)].dropna(subset=["Sharpe"]).nlargest(5,"Sharpe")
+        opp_lines = [f"  {r['Ticker']} ({r['Category']}): 5Y {r['5Y Ann %']:+.1f}%/yr, Sharpe {r['Sharpe']:.2f}, MaxDD {r['Max DD %']:.0f}%, Corr\u2192VOO {r['Corr\u2192VOO']:.2f}"
+                     for _, r in top_opp.iterrows()]
+        held_cats  = set(CATALOG.get(t,{}).get("cat","") for t in OWNED)
+        all_cats   = {"core","growth","tech","semis","dividend","value","factor","sector","intl","smallmid","realasset","bond","thematic"}
+        missing_str = ", ".join(CAT_LABEL.get(c,c) for c in all_cats - held_cats)
+        system_prompt = f"""You are an expert personal investment advisor. You are speaking with a 20-year-old F-1 visa student who is new to investing and has a long 30-40 year time horizon.
 
-        # Find top non-held ETFs (basic momentum screen)
-        top_opp = dfm_ai[~dfm_ai["Ticker"].isin(OWNED)].dropna(subset=["Sharpe"])
-        top_opp = top_opp.nlargest(5, "Sharpe")
-        opp_lines = []
-        for _, r in top_opp.iterrows():
-            opp_lines.append(f"  {r['Ticker']} ({r['Category']}): "
-                             f"5Y {r['5Y Ann %']:+.1f}%/yr, Sharpe {r['Sharpe']:.2f}, "
-                             f"MaxDD {r['Max DD %']:.0f}%, Corr→VOO {r['Corr→VOO']:.2f}")
+PHILOSOPHY: Long-term buy-and-hold. VOO always ~50%. Wants growth + diversification. Risk tolerance: moderate-high.
 
-        # Diversification gaps
-        held_cats = set(CATALOG.get(t,{}).get("cat","") for t in OWNED)
-        all_cats  = {"core","growth","tech","semis","dividend","value","factor",
-                     "sector","intl","smallmid","realasset","bond","thematic"}
-        missing   = all_cats - held_cats
-        missing_str = ", ".join(CAT_LABEL.get(c,c) for c in missing)
-
-        system_prompt = f"""You are an expert personal investment advisor with deep knowledge of ETFs, 
-portfolio theory, and market dynamics. You are speaking with a 20-year-old F-1 visa student 
-who is new to investing and has a long 30-40 year time horizon.
-
-THEIR INVESTMENT PHILOSOPHY:
-- Long-term buy-and-hold investor (not a trader)
-- VOO always ~50% of portfolio
-- Wants growth + diversification
-- Risk tolerance: moderate-high (young, long horizon, can stomach drawdowns)
-- Primary question they always want answered: "What should I be invested in for highest returns?"
-
-CURRENT HELD ETFs: {', '.join(OWNED)}
-
+HELD ETFs: {', '.join(OWNED)}
 PORTFOLIO P&L:
 {pf_summary}
-
-CURRENT METRICS FOR ALL SELECTED ETFs:
+CURRENT METRICS:
 {chr(10).join(metrics_snap)}
-
-TOP NON-HELD ETF OPPORTUNITIES (by Sharpe ratio, from the 70+ database):
+TOP NON-HELD OPPORTUNITIES (by Sharpe):
 {chr(10).join(opp_lines)}
+MISSING CATEGORIES: {missing_str}
 
-MISSING DIVERSIFICATION CATEGORIES: {missing_str}
+Be direct, specific, data-backed. Give actual ticker recommendations with reasoning. Explain simply. Remind them you are not a licensed financial advisor."""
 
-GUIDANCE:
-- Be direct and specific. Give actual ticker recommendations with reasoning.
-- Back up advice with the real metrics above.
-- Explain concepts simply since they are a beginner.
-- Acknowledge that past performance doesn't guarantee future results.
-- When answering "what should I invest in?", consider: risk-adjusted returns (Sharpe), 
-  correlation to VOO (diversification value), sector exposure gaps, and the user's long horizon.
-- Distinguish between high-return-high-risk and high-return-moderate-risk options.
-- You are NOT a licensed financial advisor; remind them of this when giving specific allocations.
-- Keep responses focused and actionable, not overly long."""
-
-        # ---- Chat UI ----
-        if "ai_messages" not in st.session_state:
-            st.session_state.ai_messages = []
-
-        # Suggested starter questions
-        starters = [
-            "What should I invest in right now for the highest returns?",
-            "How is my current portfolio performing? Any concerns?",
-            "What are the most underrated ETFs I'm not holding?",
-            "Should I add semiconductors (SMH) or spread into other sectors?",
-            "What does my Sharpe ratio tell me, and how can I improve it?",
-            "What's the best way to deploy $500 given my current holdings?",
-        ]
+        starters = ["What should I invest in right now for the highest returns?",
+                    "How is my current portfolio performing? Any concerns?",
+                    "What are the most underrated ETFs I'm not holding?",
+                    "Should I add semiconductors (SMH) or spread into other sectors?",
+                    "What does my Sharpe ratio tell me, and how can I improve it?",
+                    "What's the best way to deploy $500 given my current holdings?"]
         if not st.session_state.ai_messages:
             st.markdown(f'<div style="font-size:11.5px;color:{THEME["text2"]};margin-bottom:10px;">Suggested questions:</div>',
                         unsafe_allow_html=True)
-            starter_cols = st.columns(2)
+            sc = st.columns(2)
             for i, q in enumerate(starters):
-                with starter_cols[i % 2]:
-                    if st.button(q, key=f"starter_{i}",
-                                 help="Click to send this question"):
+                with sc[i%2]:
+                    if st.button(q, key=f"starter_{i}", help="Click to send"):
                         st.session_state.ai_messages.append({"role":"user","content":q})
                         st.rerun()
-
-        # Render conversation history
         for msg in st.session_state.ai_messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-
-        # Chat input
         if prompt := st.chat_input("Ask about your portfolio, ETFs, market outlook…"):
             st.session_state.ai_messages.append({"role":"user","content":prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
-
-            # Call Claude
             with st.chat_message("assistant"):
                 try:
                     import anthropic as _anthropic
                     client = _anthropic.Anthropic(api_key=ai_key)
-                    # Keep last 10 turns to stay within context
                     history = st.session_state.ai_messages[-10:]
                     placeholder = st.empty()
                     full_response = ""
-                    with client.messages.stream(
-                        model="claude-sonnet-4-6",
-                        max_tokens=1200,
+                    with client.messages.stream(model="claude-sonnet-4-6", max_tokens=1200,
                         system=system_prompt,
-                        messages=[{"role":m["role"],"content":m["content"]} for m in history],
-                    ) as stream:
+                        messages=[{"role":m["role"],"content":m["content"]} for m in history]) as stream:
                         for chunk in stream.text_stream:
                             full_response += chunk
                             placeholder.markdown(full_response + "▌")
                     placeholder.markdown(full_response)
-                    st.session_state.ai_messages.append(
-                        {"role":"assistant","content":full_response})
+                    st.session_state.ai_messages.append({"role":"assistant","content":full_response})
                 except ImportError:
                     st.error("Run: pip install anthropic")
                 except Exception as e:
@@ -1071,14 +998,11 @@ GUIDANCE:
                         st.error("Invalid API key. Check it in the sidebar.")
                     else:
                         st.error(f"AI error: {err}")
-
         if st.session_state.ai_messages:
             if st.button("🗑 Clear conversation"):
                 st.session_state.ai_messages = []; st.rerun()
-
         st.markdown(f'<div class="disclaim">AI responses are educational and not financial advice. '
-                    f'Claude is provided by Anthropic. Your API key is stored only in your '
-                    f'browser session and never sent anywhere except Anthropic\'s API.</div>',
+                    f'Claude is provided by Anthropic. Your API key is stored only in your browser session.</div>',
                     unsafe_allow_html=True)
 
 # ================================================================ TAB 5: CHART
@@ -1092,9 +1016,8 @@ with tab_chart:
             try: plot_df = load_intraday(sel, p, interval)
             except Exception as e: st.error(f"Intraday fetch: {e}"); plot_df = pd.DataFrame()
     else:
-        cutoff = prices.index[-1] - pd.Timedelta(days=p)
+        cutoff  = prices.index[-1] - pd.Timedelta(days=p)
         plot_df = prices[prices.index >= cutoff]
-
     palette = [THEME["gold"], THEME["orange"], THEME["green"], "#4f8ef7",
                "#a78bfa", "#2dd4bf", "#fb923c", "#e879f9", "#60a5fa", "#f87171"]
     fig = go.Figure()
@@ -1113,11 +1036,10 @@ with tab_chart:
         font=dict(family="Roboto Mono"))
     fig.update_xaxes(gridcolor=THEME["bg3"]); fig.update_yaxes(gridcolor=THEME["bg3"])
     st.plotly_chart(fig, width='stretch')
-    st.caption("1D/1W = intraday bars. 1M+ = daily total-return closes with dividends reinvested. "
-               "Younger funds (MAGS etc.) start from their own inception date.")
+    st.caption("1D/1W = intraday bars. 1M+ = daily total-return closes with dividends reinvested.")
 
 # ================================================================ FOOTER
 st.markdown(f'<div class="disclaim">Built with yfinance · pandas · plotly · streamlit — all open-source. '
-            f'Expense ratios verified ~June 2026. Technical signals (RSI, MA) are indicators, not predictions. '
+            f'Expense ratios verified ~June 2026. Technical signals are indicators, not predictions. '
             f'Portfolio projections use historical volatility via Monte Carlo — not forward-looking forecasts. '
             f'Educational tool only, not financial advice.</div>', unsafe_allow_html=True)
