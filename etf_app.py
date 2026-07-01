@@ -380,15 +380,7 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
 _app_icon = _PIL_Image.open(Path(__file__).parent / "icon.png")
 st.set_page_config(page_title="ETF Investor Bro", layout="wide", page_icon=_app_icon,
     initial_sidebar_state="expanded")
-st.markdown("""
-<link rel="manifest" href="https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/manifest.json">
-<link rel="apple-touch-icon" href="https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png">
-<link rel="shortcut icon" href="https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-title" content="ETF Investor Bro">
-<meta name="theme-color" content="#d4af37">
-""", unsafe_allow_html=True)
+
 
 THEME = dict(bg="#0d1f2d", bg2="#132233", bg3="#1f3b4d",
              gold="#d4af37", orange="#f5900a",
@@ -524,9 +516,14 @@ with st.spinner(f"Fetching live total-return data for {len(sel)} ETFs…"):
         st.error(f"Data fetch failed: {e}"); st.stop()
 
 # ================================================================ MASTHEAD + TAPE
-st.markdown(f'<div class="masthead"><h1>📈 ETF Command Center</h1>'
-            f'<span class="tag">Live Total-Return Terminal · Dividends Reinvested · {dt.date.today()}</span>'
-            f'</div>', unsafe_allow_html=True)
+icon_url = "https://raw.githubusercontent.com/YoungCoderPro/ETF-Investor/main/icon.png"
+st.markdown(f'''<div class="masthead" style="align-items:center;gap:16px;">
+  <img src="{icon_url}" style="width:54px;height:54px;border-radius:10px;flex-shrink:0;">
+  <div>
+    <h1 style="margin:0;">ETF INVESTOR BRO</h1>
+    <span class="tag">Live Total-Return Terminal &middot; Dividends Reinvested &middot; {dt.date.today()}</span>
+  </div>
+</div>''', unsafe_allow_html=True)
 
 tape_html = ""
 for t in sel:
