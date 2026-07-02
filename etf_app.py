@@ -715,6 +715,351 @@ def compute_pnl(trades: list, prices: pd.DataFrame, live_quotes: dict = None) ->
                      "Ann. %": round(ann, 2), "Days": days, "Note": trade.get("note","")})
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
+# ================================================================ v5: HEALTH SCORE ENGINE
+
+def compute_health_score(holdings_vals: dict, prices: pd.DataFrame) -> dict:
+    """
+    Transparent 5-factor portfolio grade (0-100 -> A-F). Self-built, no black box.
+      1. Diversification breadth (20): distinct asset categories held
+      2. Concentration (20): position sizing (VOO exempt up to 50% by design)
+      3. Correlation redundancy (20): avg pairwise correlation of holdings
+      4. Fee efficiency (20): dollar-weighted expense ratio
+      5. Sector balance (20): aggregate tech/growth/semis weight
+    """
+    total = sum(holdings_vals.values())
+    if total <= 0 or not holdings_vals:
+        return {"score": 0, "grade": "\u2014", "factors": [], "total": 0}
+    weights = {t: v/total for t, v in holdings_vals.items()}
+    factors = []
+
+    # 1 — breadth
+    cats = set(CATALOG.get(t, {}).get("cat", "custom") for t in holdings_vals)
+    breadth_pts = min(len(cats)/6, 1.0) * 20
+    factors.append({"name": "Diversification breadth", "pts": round(breadth_pts,1), "max": 20,
+                    "detail": f"{len(cats)} asset categories held (6+ for full marks)"})
+
+    # 2 — concentration (VOO core exempt to 50%)
+    conc_pen = 0.0
+    for t, w in weights.items():
+        limit = 0.50 if t == "VOO" else 0.25
+        if w > limit: conc_pen += (w - limit) * 100
+    conc_pts = max(0, 20 - conc_pen)
+    worst = max(weights, key=weights.get)
+    factors.append({"name": "Position concentration", "pts": round(conc_pts,1), "max": 20,
+                    "detail": f"largest: {worst} at {weights[worst]*100:.0f}% "
+                              f"(VOO allowed 50%, others 25%)"})
+
+    # 3 — correlation redundancy
+    corr_pts, corr_detail = 10.0, "insufficient data"
+    tickers = [t for t in holdings_vals if t in prices.columns]
+    if len(tickers) >= 2:
+        rets = prices[tickers].pct_change().dropna()
+        if len(rets) > 30:
+            cm = rets.corr().values
+            n  = len(tickers)
+            avg_corr = (cm.sum() - n) / (n*n - n)
+            corr_pts = max(0.0, min(20.0, (1.05 - avg_corr) * 40))
+            corr_detail = f"avg pairwise correlation {avg_corr:.2f} (lower = truer diversification)"
+    factors.append({"name": "Correlation redundancy", "pts": round(corr_pts,1), "max": 20,
+                    "detail": corr_detail})
+
+    # 4 — fee efficiency (dollar-weighted ER)
+    w_er = sum(weights[t] * (CATALOG.get(t, {}).get("er") or 0.20) for t in weights)
+    fee_pts = max(0.0, min(20.0, (0.40 - w_er) / 0.35 * 20))
+    factors.append({"name": "Fee efficiency", "pts": round(fee_pts,1), "max": 20,
+                    "detail": f"dollar-weighted expense ratio {w_er:.3f}% "
+                              f"(\u22640.05% full marks)"})
+
+    # 5 — sector balance (tech-family weight)
+    tech_w = sum(w for t, w in weights.items()
+                 if CATALOG.get(t, {}).get("cat") in ("tech","semis","growth"))
+    sector_pts = 20.0 if tech_w <= 0.35 else max(0.0, 20 - (tech_w-0.35)*60)
+    factors.append({"name": "Sector balance", "pts": round(sector_pts,1), "max": 20,
+                    "detail": f"tech/growth/semis = {tech_w*100:.0f}% of portfolio "
+                              f"(\u226435% full marks)"})
+
+    score = round(sum(f["pts"] for f in factors), 1)
+    grade = ("A" if score >= 85 else "B" if score >= 70 else
+             "C" if score >= 55 else "D" if score >= 40 else "F")
+    return {"score": score, "grade": grade, "factors": factors, "total": total}
+
+# ================================================================ v5: TIME-WEIGHTED RETURN
+
+def compute_twr(trades: list, prices: pd.DataFrame) -> dict:
+    """
+    True Time-Weighted Return: strips out WHEN you added money, isolating the
+    strategy's own performance. Chain-links daily returns, adjusting the
+    denominator on days cash flowed in:  factor_t = V_t / (V_{t-1} + flow_t).
+    """
+    if not trades: return {}
+    try:
+        events = {}
+        for tr in trades:
+            t = tr["ticker"]
+            if t not in prices.columns: continue
+            s = prices[t].dropna()
+            bd = pd.Timestamp(tr["date"])
+            fut = s[s.index >= bd]
+            if fut.empty: continue
+            d0, px0 = fut.index[0], float(fut.iloc[0])
+            events.setdefault(d0, []).append((t, float(tr["amount"])/px0, float(tr["amount"])))
+        if not events: return {}
+        start = min(events)
+        idx = prices.index[prices.index >= start]
+        shares, factors, prev_v = {}, [], None
+        for d in idx:
+            flow = 0.0
+            if d in events:
+                for t, sh, amt in events[d]:
+                    shares[t] = shares.get(t, 0) + sh
+                    flow += amt
+            v = sum(sh * float(prices[t].asof(d)) for t, sh in shares.items()
+                    if t in prices.columns and pd.notna(prices[t].asof(d)))
+            if prev_v is not None and (prev_v + flow) > 0:
+                factors.append(v / (prev_v + flow))
+            prev_v = v
+        if not factors: return {}
+        twr_total = float(np.prod(factors)) - 1
+        days = max((idx[-1] - idx[0]).days, 1)
+        twr_ann = (1 + twr_total) ** (365.0/days) - 1 if days >= 14 else twr_total
+        return {"twr_total": round(twr_total*100, 2),
+                "twr_ann":   round(float(np.clip(twr_ann*100, -99.9, 999)), 2),
+                "days": days}
+    except Exception:
+        return {}
+
+# ================================================================ v5: AGGREGATE EXPOSURE
+
+def aggregate_exposure(holdings_vals: dict) -> dict:
+    """
+    Blend every held ETF's sector weights and top holdings, weighted by YOUR
+    dollars, into one true portfolio-level exposure. Auto-adjusts when
+    holdings change (add VNQ -> real estate appears instantly).
+    """
+    total = sum(holdings_vals.values())
+    if total <= 0: return {}
+    sectors, stocks = {}, {}
+    for t, v in holdings_vals.items():
+        ov = get_fund_overview(t)
+        sw = ov.get("sector_weights") or {}
+        for k, w in sw.items():
+            if w and w > 0.001:
+                key = k.replace("_"," ").title()
+                sectors[key] = sectors.get(key, 0) + w * v
+        th = ov.get("top_holdings")
+        if th is not None and not th.empty and "Holding Percent" in th.columns:
+            for sym, row in th.iterrows():
+                w = float(row["Holding Percent"])
+                if w <= 0: continue
+                if sym not in stocks:
+                    stocks[sym] = {"dollars": 0.0, "in_etfs": {}}
+                stocks[sym]["dollars"] += w * v
+                stocks[sym]["in_etfs"][t] = round(w*100, 1)
+    sector_pct = {k: round(v/total*100, 1) for k, v in
+                  sorted(sectors.items(), key=lambda x: -x[1])}
+    stock_rows = [{"symbol": s, "pct_of_pf": round(d["dollars"]/total*100, 2),
+                   "dollars": round(d["dollars"], 2), "in_etfs": d["in_etfs"]}
+                  for s, d in stocks.items()]
+    stock_rows.sort(key=lambda x: -x["pct_of_pf"])
+    return {"sectors": sector_pct, "stocks": stock_rows, "total": total}
+
+# ================================================================ v5: REBALANCING ASSISTANT
+
+def rebalance_plan(actual_vals: dict, targets_pct: dict, contribution: float) -> dict:
+    """
+    Buy-only rebalancing: allocate the next contribution across underweight
+    ETFs, proportional to each one's dollar deficit vs target. Never sells.
+    """
+    cur_total = sum(actual_vals.values())
+    new_total = cur_total + contribution
+    deficits  = {}
+    for t, tgt in targets_pct.items():
+        desired = new_total * tgt / 100.0
+        deficits[t] = max(desired - actual_vals.get(t, 0.0), 0.0)
+    tot_def = sum(deficits.values())
+    if tot_def <= 0:
+        n = max(len(targets_pct), 1)
+        buys = {t: round(contribution/n, 2) for t in targets_pct}
+    else:
+        buys = {t: round(contribution * d / tot_def, 2) for t, d in deficits.items() if d > 0}
+    after = {t: actual_vals.get(t,0) + buys.get(t,0) for t in targets_pct}
+    after_pct = {t: round(v/new_total*100, 1) for t, v in after.items()} if new_total>0 else {}
+    return {"buys": {t: b for t, b in buys.items() if b >= 0.01}, "after_pct": after_pct}
+
+# ================================================================ v5: WHAT-IF LAB ENGINES
+
+@st.cache_data(ttl=60*60*6, show_spinner=False)
+def backtest_dca(ticker: str, monthly: float, start: str, _key: str = "") -> dict:
+    """DCA backtest on real history: buy on first trading day each month."""
+    try:
+        px = yf.download(ticker, start=start, auto_adjust=True, progress=False)["Close"].dropna()
+        if isinstance(px, pd.DataFrame): px = px.iloc[:, 0]
+        if len(px) < 25: return {}
+        monthly_firsts = px.groupby([px.index.year, px.index.month]).head(1)
+        shares = invested = 0.0
+        for d, p in monthly_firsts.items():
+            shares += monthly / float(p); invested += monthly
+        end_val = shares * float(px.iloc[-1])
+        yrs = max((px.index[-1] - px.index[0]).days / 365.25, 0.1)
+        return {"invested": round(invested, 2), "end_value": round(end_val, 2),
+                "gain": round(end_val - invested, 2),
+                "gain_pct": round((end_val/invested - 1) * 100, 1) if invested else 0,
+                "n_buys": len(monthly_firsts), "years": round(yrs, 1)}
+    except Exception:
+        return {}
+
+def backtest_swap(trades: list, swap_from: str, swap_to: str, prices_all: pd.DataFrame) -> dict:
+    """Replay your ACTUAL trade history with one ticker swapped for another."""
+    def _end_val(tks):
+        total_in = total_out = 0.0
+        for tr in tks:
+            t = tr["ticker"]
+            if t not in prices_all.columns: continue
+            s = prices_all[t].dropna()
+            bd = pd.Timestamp(tr["date"]); fut = s[s.index >= bd]
+            if fut.empty: continue
+            px0 = float(fut.iloc[0]); amt = float(tr["amount"])
+            total_in  += amt
+            total_out += amt / px0 * float(s.iloc[-1])
+        return total_in, total_out
+    real_in, real_out = _end_val(trades)
+    swapped = [dict(tr, ticker=swap_to) if tr["ticker"] == swap_from else tr for tr in trades]
+    _, swap_out = _end_val(swapped)
+    return {"real_value": round(real_out, 2), "swap_value": round(swap_out, 2),
+            "difference": round(swap_out - real_out, 2), "invested": round(real_in, 2)}
+
+def compound_series(monthly: float, years: int, annual_rate: float, start_val: float = 0.0):
+    """Exact monthly compounding series for the Money Machine visualizer."""
+    r = (1 + annual_rate) ** (1/12) - 1
+    vals, v = [], start_val
+    for m in range(years * 12 + 1):
+        vals.append(v)
+        v = v * (1 + r) + monthly
+    return pd.Series(vals, index=[m/12 for m in range(years*12 + 1)])
+
+# ================================================================ v5: DIVIDEND TAX ESTIMATOR
+
+def dividend_tax_estimate(div_by_ticker: dict, income_bracket: str) -> dict:
+    """
+    Informational estimate of tax owed on dividends (owed even if reinvested,
+    in a taxable account). Qualified share per ETF type; rates by bracket.
+    """
+    QUAL_SHARE = {"VXUS": 0.70, "VEA": 0.72, "VWO": 0.60, "IEFA": 0.72, "IEMG": 0.60,
+                  "BND": 0.0, "AGG": 0.0, "TLT": 0.0, "SGOV": 0.0, "JEPI": 0.20, "JEPQ": 0.20}
+    qual_rate = {"~$0-47k (student)": 0.00, "$47k-100k": 0.15, "$100k-500k": 0.15, "$500k+": 0.20}[income_bracket]
+    ord_rate  = {"~$0-47k (student)": 0.12, "$47k-100k": 0.22, "$100k-500k": 0.32, "$500k+": 0.37}[income_bracket]
+    rows, total_tax, total_div = [], 0.0, 0.0
+    for t, ann_div in div_by_ticker.items():
+        qs   = QUAL_SHARE.get(t, 0.95)
+        qtax = ann_div * qs * qual_rate
+        otax = ann_div * (1-qs) * ord_rate
+        tax  = qtax + otax
+        rows.append({"Ticker": t, "Annual Div $": round(ann_div, 2),
+                     "Qualified %": int(qs*100), "Est. Tax $": round(tax, 2)})
+        total_tax += tax; total_div += ann_div
+    return {"rows": rows, "total_tax": round(total_tax, 2), "total_div": round(total_div, 2),
+            "qual_rate": qual_rate, "ord_rate": ord_rate}
+
+# ================================================================ v5: INVESTOR PROFILE
+
+PROFILE_FILE = Path(__file__).parent / "profile.json"
+
+def load_profile() -> dict:
+    sb = _get_sb()
+    if sb:
+        try:
+            res = sb.table("user_profile").select("*").eq("id", "me").execute().data
+            if res: return res[0].get("data", {}) or {}
+        except Exception: pass
+    try:
+        return json.loads(PROFILE_FILE.read_text()) if PROFILE_FILE.exists() else {}
+    except Exception: return {}
+
+def save_profile(profile: dict):
+    sb = _get_sb()
+    if sb:
+        try:
+            sb.table("user_profile").upsert({"id": "me", "data": profile,
+                "updated_at": dt.datetime.utcnow().isoformat()}).execute()
+        except Exception: pass
+    try: PROFILE_FILE.write_text(json.dumps(profile, indent=2))
+    except Exception: pass
+
+QUIZ = [
+    ("horizon", "When will you realistically need this money?",
+     [("Within 5 years", 1), ("5-15 years", 2), ("15-30 years", 3), ("30+ years \u2014 this is retirement money", 4)]),
+    ("drawdown", "Your portfolio drops 35% in a crash. What do you actually do?",
+     [("Sell everything \u2014 can't sleep", 1), ("Sell some, keep the rest", 2),
+      ("Hold and wait it out", 3), ("Buy more \u2014 stocks are on sale", 4)]),
+    ("income", "How stable is your income / cash cushion?",
+     [("Unstable, no emergency fund", 1), ("Some savings, income varies", 2),
+      ("Stable income, 3mo emergency fund", 3), ("Very stable + 6mo+ cushion", 4)]),
+    ("knowledge", "How well do you understand what you own?",
+     [("I buy what people recommend", 1), ("I know the basics of my ETFs", 2),
+      ("I read holdings, fees, and metrics", 3), ("I analyze overlap, factor exposure, macro", 4)]),
+    ("goal", "What is the primary job of this portfolio?",
+     [("Preserve what I have", 1), ("Steady income", 2),
+      ("Balanced growth", 3), ("Maximum long-term growth", 4)]),
+    ("checking", "How often do you check your portfolio?",
+     [("Multiple times a day \u2014 it stresses me", 1), ("Daily, calmly", 3),
+      ("Weekly", 4), ("Monthly or less", 4)]),
+]
+
+def score_quiz(answers: dict) -> dict:
+    total = sum(answers.values())
+    max_t = len(QUIZ) * 4
+    pct   = total / max_t
+    if pct >= 0.85:
+        ptype, desc = "Aggressive Growth Accumulator", \
+            ("Long horizon, strong stomach, stable base. Equity-heavy portfolios (90-100% stocks) "
+             "with growth tilts suit you. Your biggest risk isn't volatility \u2014 it's under-investing.")
+    elif pct >= 0.65:
+        ptype, desc = "Growth-Oriented Builder", \
+            ("You can handle meaningful volatility for higher returns. 80-90% equities with a "
+             "diversified core is your zone. Watch concentration in any single sector.")
+    elif pct >= 0.45:
+        ptype, desc = "Balanced Strategist", \
+            ("You value growth but feel drawdowns. 60-75% equities with international and "
+             "some defensive ballast (dividends, bonds) fits your temperament.")
+    else:
+        ptype, desc = "Capital Preserver", \
+            ("Stability matters more than maximum growth right now. Broad core funds, "
+             "dividend payers, and bonds deserve larger weights until your base strengthens.")
+    return {"type": ptype, "description": desc, "score": total, "max": max_t,
+            "pct": round(pct*100), "answers": answers,
+            "taken_at": str(dt.date.today())}
+
+# ================================================================ v5: GLOSSARY
+
+GLOSSARY = {
+    "Sharpe": "Return earned per unit of volatility you sat through, vs parking cash at 2%. Above 1.0 = you were well paid for the ride's bumps.",
+    "Sortino": "Like Sharpe, but only counts DOWNWARD swings as risk \u2014 upside surprises don't get penalized.",
+    "Max DD": "Max Drawdown: the worst peak-to-bottom fall in history. The pain you must be able to endure without selling.",
+    "Vol": "Volatility: how violently the price swings around its average, annualized. Higher = wilder ride, not necessarily worse returns.",
+    "Corr\u2192VOO": "Correlation to the S&P 500 from -1 to 1. Near 1.0 = moves in lockstep (little diversification). Below 0.6 = genuinely different behavior.",
+    "ER": "Expense Ratio: the fund's annual fee, silently deducted. 0.03% = $3/yr per $10k. Compounds against you forever.",
+    "TR": "Total Return: price change PLUS dividends reinvested \u2014 the real return an investor actually experienced.",
+    "Ann": "Annualized: converted to a per-year rate so different time periods compare fairly.",
+    "TWR": "Time-Weighted Return: your strategy's true performance with the timing of your deposits mathematically removed. The fair way to judge your picks.",
+    "RSI": "Relative Strength Index (0-100): momentum gauge. Below 30 = historically oversold (potential value), above 70 = overheated.",
+    "Golden cross": "50-day average price rises above the 200-day \u2014 a classic long-term bullish trend signal.",
+    "Death cross": "50-day average falls below the 200-day \u2014 a bearish trend signal. Historically noisy, not destiny.",
+    "DCA": "Dollar-Cost Averaging: investing a fixed amount on a schedule regardless of price. Buys more shares when cheap, fewer when expensive.",
+    "HHI": "A concentration measure: sums squared weights. High = eggs in few baskets.",
+    "Beta": "Sensitivity to the market: 1.3 beta rises/falls ~30% harder than the S&P 500.",
+    "Qualified dividend": "Dividends taxed at the lower capital-gains rate (0% if your income is under ~$47k) instead of ordinary income rates.",
+    "Roth IRA": "Retirement account: pay tax now, then ALL growth and withdrawals after 59\u00bd are tax-free forever. Best home for high-dividend funds.",
+    "NAV": "Net Asset Value: the per-share worth of everything the fund holds.",
+}
+
+def gloss(term: str, label: str = None) -> str:
+    """Wrap a term with a hover tooltip from the glossary."""
+    tip = GLOSSARY.get(term, "")
+    lbl = label or term
+    if not tip: return lbl
+    safe = tip.replace('"', '&quot;')
+    return f'<span class="gl" title="{safe}">{lbl}</span>'
+
 # ================================================================ UI SETUP
 try:
     _icon = _PIL_Image.open(Path(__file__).parent/"icon.png")
@@ -762,6 +1107,7 @@ section[data-testid="stSidebar"]{{background:{T['bg2']};border-right:1px solid {
 .news-title{{font-size:13px;color:{T['text']};line-height:1.4;}}
 .news-meta{{font-size:10.5px;color:{T['text3']};margin-top:3px;}}
 .fg-box{{border-radius:10px;padding:20px;text-align:center;}}
+.gl{{border-bottom:1px dotted {T['text2']};cursor:help;}}
 .disclaim{{color:{T['text3']};font-size:10.5px;line-height:1.6;border-top:1px solid {T['bg3']};padding-top:14px;margin-top:24px;}}
 </style>""", unsafe_allow_html=True)
 
@@ -902,9 +1248,10 @@ st.markdown(f'<div class="tape-wrap"><div class="tape">{tape_html*3}</div></div>
             unsafe_allow_html=True)
 
 # ================================================================ TABS
-tab_board, tab_pf, tab_pulse, tab_ai, tab_chart = st.tabs([
+tab_board, tab_pf, tab_pulse, tab_lab, tab_ai, tab_profile, tab_chart = st.tabs([
     "\U0001f4cb  BOARD", "\U0001f4bc  MY PORTFOLIO",
-    "\U0001f4f0  MARKET PULSE", "\U0001f916  AI ADVISOR", "\U0001f4c8  CHART"])
+    "\U0001f4f0  MARKET PULSE", "\U0001f9ea  WHAT-IF LAB",
+    "\U0001f916  AI ADVISOR", "\U0001f464  MY PROFILE", "\U0001f4c8  CHART"])
 
 # ================================================================ TAB 1: BOARD
 with tab_board:
@@ -959,12 +1306,24 @@ with tab_board:
 
     st.markdown(f'<div style="overflow-x:auto;border:1px solid {T["bg3"]};border-radius:6px;">'
                 f'<table class="board"><thead><tr>'
-                f'<th>ETF</th><th>Price</th><th>Expense</th>'
-                f'<th>1Y TR</th><th>3Y Ann</th><th>5Y Ann</th><th>10Y Ann</th>'
-                f'<th>Vol</th><th>Sharpe\u2020</th><th>Max DD</th>'
-                f'<th>Corr\u2192VOO</th><th>vs S&P 5Y</th></tr></thead>'
+                f'<th>ETF</th><th>Price</th><th>{gloss("ER","Expense")}</th>'
+                f'<th>{gloss("TR","1Y TR")}</th><th>{gloss("Ann","3Y Ann")}</th>'
+                f'<th>{gloss("Ann","5Y Ann")}</th><th>{gloss("Ann","10Y Ann")}</th>'
+                f'<th>{gloss("Vol")}</th><th>{gloss("Sharpe","Sharpe\u2020")}</th>'
+                f'<th>{gloss("Max DD")}</th>'
+                f'<th>{gloss("Corr\u2192VOO")}</th><th>vs S&P 5Y</th></tr></thead>'
                 f'<tbody>{rows_html}</tbody></table></div>', unsafe_allow_html=True)
-    st.caption("Total returns: dividends reinvested + expense ratios already deducted (baked into yfinance NAV prices). \u2020Sharpe uses 2% risk-free rate. Past performance \u2260 future results.")
+    st.caption("Hover any dotted-underline term for a plain-English explanation. "
+               "Total returns: dividends reinvested + fees already deducted. \u2020Sharpe uses 2% risk-free rate. Past performance \u2260 future results.")
+    # Cost of waiting — worked into the board as requested
+    if "VOO" in prices.columns:
+        _voo10 = trailing_ann(prices["VOO"].dropna(), 10)
+        if pd.notna(_voo10):
+            _cost1y = 1000 * ((1 + _voo10/100) ** 1 - 1)
+            st.markdown(f'<div style="font-size:11.5px;color:{T["orange"]};margin:4px 0 0;">'
+                        f'\u23f3 <b>Cost of waiting:</b> at VOO\u2019s 10-yr average ({_voo10:.1f}%/yr), '
+                        f'every $1,000 left uninvested for a year historically forfeited ~${_cost1y:,.0f} of growth '
+                        f'\u2014 and that gap compounds for decades.</div>', unsafe_allow_html=True)
 
     # ---- Annual Returns Heatmap ----
     st.markdown('<div class="lbl">Annual Returns Heatmap \u2014 year-by-year at a glance</div>',
@@ -1197,6 +1556,48 @@ with tab_pf:
             mc(m4,"Total return",f'{"+" if tp>=0 else ""}{tp:.1f}%',
                T["green"] if tp>=0 else T["red"])
 
+            # ---- v5: PORTFOLIO HEALTH SCORE ----
+            st.markdown('<div class="lbl">Portfolio Health Score</div>', unsafe_allow_html=True)
+            hv = pnl_df.groupby("Ticker")["Cur. Value $"].sum().to_dict()
+            hs = compute_health_score(hv, prices)
+            g_color = (T["green"] if hs["grade"]=="A" else "#9ccc65" if hs["grade"]=="B"
+                       else T["orange"] if hs["grade"]=="C" else "#ff8a65" if hs["grade"]=="D" else T["red"])
+            hc1, hc2 = st.columns([1, 2.5])
+            with hc1:
+                st.markdown(f'<div class="card" style="text-align:center;padding:24px;">'
+                            f'<div style="font-family:Oswald;font-size:64px;font-weight:700;color:{g_color};line-height:1;">{hs["grade"]}</div>'
+                            f'<div style="font-size:20px;color:{T["text"]};margin-top:6px;">{hs["score"]}/100</div>'
+                            f'<div style="font-size:10px;color:{T["text3"]};margin-top:4px;">5-factor transparent algorithm</div>'
+                            f'</div>', unsafe_allow_html=True)
+            with hc2:
+                for f_ in hs["factors"]:
+                    pct_f = f_["pts"]/f_["max"]*100
+                    bar_c = T["green"] if pct_f>=75 else T["orange"] if pct_f>=45 else T["red"]
+                    st.markdown(
+                        f'<div style="margin-bottom:7px;">'
+                        f'<div style="display:flex;justify-content:space-between;font-size:11.5px;">'
+                        f'<span style="color:{T["text"]};">{f_["name"]}</span>'
+                        f'<span style="color:{bar_c};font-weight:600;">{f_["pts"]}/{f_["max"]}</span></div>'
+                        f'<div style="background:{T["bg3"]};border-radius:3px;height:7px;margin:3px 0;">'
+                        f'<div style="background:{bar_c};width:{pct_f:.0f}%;height:100%;border-radius:3px;"></div></div>'
+                        f'<div style="font-size:10px;color:{T["text3"]};">{f_["detail"]}</div></div>',
+                        unsafe_allow_html=True)
+
+            # ---- v5: TIME-WEIGHTED RETURN ----
+            twr = compute_twr(trades, pf_px)
+            if twr:
+                st.markdown(f'<div class="lbl">{gloss("TWR","True Performance \u2014 Time-Weighted Return")}</div>',
+                            unsafe_allow_html=True)
+                tw1, tw2, tw3 = st.columns(3)
+                tw_c = T["green"] if twr["twr_ann"]>=0 else T["red"]
+                mc(tw1, "TWR (annualized)", f'{twr["twr_ann"]:+.1f}%/yr', tw_c)
+                mc(tw2, "TWR (total)", f'{twr["twr_total"]:+.1f}%', tw_c)
+                mc(tw3, "Simple return", f'{tp:+.1f}%',
+                   T["green"] if tp>=0 else T["red"])
+                st.caption("TWR removes the timing of your deposits \u2014 it grades your STRATEGY. "
+                           "Simple return mixes in when you happened to add cash. If TWR > simple return, "
+                           "your recent deposits haven't had time to grow yet; the strategy itself is doing better than the raw number suggests.")
+
             rpf = ""
             for _, r in pnl_df.iterrows():
                 pos  = r["Gain $"]>=0
@@ -1308,6 +1709,94 @@ with tab_pf:
                 st.markdown(f'<span style="color:{color};font-size:12.5px;">{dr["Signal"]}</span> '
                             f'<span style="color:{T["text3"]};font-size:11px;">(target {dr["Target %"]}% / actual {dr["Actual %"]}%)</span>',
                             unsafe_allow_html=True)
+
+            # ---- v5: REBALANCING ASSISTANT ----
+            st.markdown('<div class="lbl">Rebalancing Assistant \u2014 exact dollars for your next buy</div>',
+                        unsafe_allow_html=True)
+            contrib = st.number_input("Your next contribution ($)", min_value=10.0,
+                                      value=200.0, step=25.0, key="reb_contrib")
+            plan = rebalance_plan(actual, targets, contrib)
+            if plan["buys"]:
+                rb1, rb2 = st.columns([1.3, 1])
+                with rb1:
+                    st.markdown(f'<div class="card"><div style="font-size:11px;color:{T["gold"]};'
+                                f'font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">'
+                                f'Split your ${contrib:,.0f} like this:</div>', unsafe_allow_html=True)
+                    for t_, b_ in sorted(plan["buys"].items(), key=lambda x: -x[1]):
+                        pct_b = b_/contrib*100
+                        st.markdown(
+                            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">'
+                            f'<span style="font-family:Oswald;font-weight:700;color:{T["text"]};width:52px;">{t_}</span>'
+                            f'<div style="flex:1;background:{T["bg3"]};height:14px;border-radius:3px;">'
+                            f'<div style="background:{T["gold"]};width:{pct_b:.0f}%;height:100%;border-radius:3px;"></div></div>'
+                            f'<span style="color:{T["green"]};font-weight:600;font-size:14px;width:70px;text-align:right;">${b_:,.2f}</span>'
+                            f'</div>', unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+                with rb2:
+                    pie_after = go.Figure(go.Pie(
+                        labels=list(plan["after_pct"].keys()),
+                        values=list(plan["after_pct"].values()), hole=0.45,
+                        marker=dict(colors=[T["gold"],T["orange"],T["green"],"#4f8ef7","#a78bfa","#2dd4bf"]),
+                        textinfo="label+percent"))
+                    pie_after.update_layout(template="plotly_dark", height=260,
+                        paper_bgcolor=T["bg"], margin=dict(l=10,r=10,t=30,b=10),
+                        title=dict(text="Allocation after this buy", font=dict(size=12)),
+                        showlegend=False, font=dict(family="Roboto Mono", size=10))
+                    st.plotly_chart(pie_after, use_container_width=True)
+                st.caption("Buy-only rebalancing: your contribution goes to whichever ETFs are furthest below target, "
+                           "proportionally to their dollar deficit. Nothing is ever sold.")
+
+        # ---- v5: TRUE AGGREGATE EXPOSURE ----
+        if not pnl_df.empty:
+            st.markdown('<div class="lbl">True Exposure X-Ray \u2014 what you ACTUALLY own across all ETFs</div>',
+                        unsafe_allow_html=True)
+            with st.spinner("Blending fund holdings, dollar-weighted\u2026"):
+                agg = aggregate_exposure(pnl_df.groupby("Ticker")["Cur. Value $"].sum().to_dict())
+            if agg and (agg.get("sectors") or agg.get("stocks")):
+                x1, x2 = st.columns(2)
+                with x1:
+                    st.markdown("##### \U0001f3ed Portfolio-wide sector mix")
+                    swp = agg["sectors"]
+                    if swp:
+                        xfig = go.Figure(go.Bar(
+                            x=list(swp.values()), y=list(swp.keys()), orientation="h",
+                            marker=dict(color=list(swp.values()),
+                                        colorscale=[[0,T["bg3"]],[1,T["gold"]]], showscale=False),
+                            text=[f"{v:.1f}%" for v in swp.values()], textposition="outside",
+                            textfont=dict(color=T["text2"], size=11)))
+                        xfig.update_layout(template="plotly_dark", height=max(260, 26*len(swp)),
+                            paper_bgcolor=T["bg"], margin=dict(l=10,r=55,t=10,b=10),
+                            xaxis=dict(gridcolor=T["bg3"], title="% of your total dollars"),
+                            font=dict(family="Roboto Mono", size=11))
+                        st.plotly_chart(xfig, use_container_width=True)
+                        top_sec = next(iter(swp.items()), None)
+                        if top_sec and top_sec[1] > 35:
+                            st.warning(f"\u26a0 {top_sec[1]:.0f}% of your money is in {top_sec[0]} "
+                                       f"once every fund is blended. That's real concentration \u2014 "
+                                       f"the sector chart per-ETF hides this.")
+                with x2:
+                    st.markdown("##### \U0001f50d Your true top stock positions")
+                    st.caption("Dollar-weighted across every ETF you own. One company in 3 funds = one combined position.")
+                    for srow in agg["stocks"][:10]:
+                        etf_list = " + ".join(f"{e} ({w}%)" for e, w in srow["in_etfs"].items())
+                        multi = len(srow["in_etfs"]) > 1
+                        flag = f' <span style="color:{T["orange"]};font-size:9px;">\u26a0 {len(srow["in_etfs"])} funds</span>' if multi else ""
+                        st.markdown(
+                            f'<div style="display:flex;justify-content:space-between;align-items:baseline;'
+                            f'padding:5px 0;border-bottom:1px solid {T["bg3"]};">'
+                            f'<span style="font-family:monospace;font-weight:700;color:{T["text"]};">{srow["symbol"]}{flag}</span>'
+                            f'<span style="color:{T["gold"]};font-weight:600;">{srow["pct_of_pf"]:.1f}% \u00b7 ${srow["dollars"]:,.0f}</span>'
+                            f'</div>'
+                            f'<div style="font-size:9.5px;color:{T["text3"]};margin-bottom:3px;">{etf_list}</div>',
+                            unsafe_allow_html=True)
+                    known_top = sum(s["pct_of_pf"] for s in agg["stocks"][:10])
+                    st.markdown(f'<div style="margin-top:8px;font-size:12px;color:{T["text2"]};">'
+                                f'Your top 10 real positions = <b style="color:{T["gold"]};">{known_top:.0f}%</b> '
+                                f'of your portfolio (from disclosed top holdings). '
+                                f'Add or remove ETFs and this recalculates automatically.</div>',
+                                unsafe_allow_html=True)
+            else:
+                st.caption("Holdings data unavailable for aggregation right now.")
 
         # Monte Carlo
         st.markdown('<div class="lbl">10-Year Projection (Monte Carlo, 2,000 paths)</div>', unsafe_allow_html=True)
@@ -1540,6 +2029,190 @@ with tab_pulse:
     else:
         st.caption("No news available right now.")
 
+# ================================================================ TAB: WHAT-IF LAB
+with tab_lab:
+    st.markdown('<div class="lbl">What-If Lab \u2014 test decisions on real history before making them</div>',
+                unsafe_allow_html=True)
+    lab_trades = load_portfolio()
+
+    # ---- Scenario 1: extra monthly contribution ----
+    st.markdown("##### \U0001f4b0 What if I invested $___/month more?")
+    st.caption("Backtested with actual historical prices \u2014 monthly buys on the first trading day of each month, dividends reinvested.")
+    w1, w2, w3 = st.columns(3)
+    with w1: dca_tk  = st.selectbox("Into which ETF:", [t for t in sel], key="lab_dca_tk")
+    with w2: dca_amt = st.number_input("Monthly amount ($)", min_value=10.0, value=100.0, step=25.0, key="lab_dca_amt")
+    with w3: dca_yrs = st.selectbox("Looking back:", ["3 years", "5 years", "10 years"], index=1, key="lab_dca_yrs")
+    yrs_n = int(dca_yrs.split()[0])
+    dca_start = str(dt.date.today() - dt.timedelta(days=yrs_n*365))
+    bt = backtest_dca(dca_tk, dca_amt, dca_start, _key=f"{dca_tk}{dca_amt}{yrs_n}")
+    if bt:
+        b1, b2, b3, b4 = st.columns(4)
+        gc = T["green"] if bt["gain"] >= 0 else T["red"]
+        for col, lbl_, val_, c_ in [
+            (b1, "You'd have invested", f"${bt['invested']:,.0f}", T["text"]),
+            (b2, "It would be worth", f"${bt['end_value']:,.0f}", T["gold"]),
+            (b3, "Profit", f"${bt['gain']:+,.0f}", gc),
+            (b4, "Return", f"{bt['gain_pct']:+.1f}%", gc)]:
+            col.markdown(f'<div class="card" style="text-align:center;">'
+                         f'<div style="font-size:10px;color:{T["text3"]};text-transform:uppercase;">{lbl_}</div>'
+                         f'<div style="font-size:19px;font-weight:700;color:{c_};margin-top:5px;">{val_}</div>'
+                         f'</div>', unsafe_allow_html=True)
+        st.caption(f"{bt['n_buys']} automatic buys over {bt['years']} years. This is DCA discipline made visible.")
+    else:
+        st.caption("Not enough history for this ETF/period combination.")
+
+    st.divider()
+
+    # ---- Scenario 2: swap one holding ----
+    st.markdown("##### \U0001f501 What if I had bought ___ instead of ___?")
+    st.caption("Replays your ACTUAL recorded trades with one ticker swapped, same dates and dollar amounts.")
+    if lab_trades:
+        held_now = sorted(set(t["ticker"] for t in lab_trades))
+        sw1, sw2 = st.columns(2)
+        with sw1: swap_from = st.selectbox("Swap out (from your real trades):", held_now, key="lab_swf")
+        with sw2: swap_to   = st.selectbox("Swap in:", [t for t in CATALOG if t != swap_from], key="lab_swt")
+        if st.button("Run swap backtest", use_container_width=True, key="lab_swap_btn"):
+            need = tuple(set(held_now) | {swap_to})
+            try:    px_all = load_prices(need)
+            except Exception: px_all = prices
+            sw = backtest_swap(lab_trades, swap_from, swap_to, px_all)
+            d_c = T["green"] if sw["difference"] >= 0 else T["red"]
+            verdict = (f"{swap_to} would have made you ${sw['difference']:,.2f} MORE"
+                       if sw["difference"] >= 0 else
+                       f"{swap_to} would have made you ${abs(sw['difference']):,.2f} LESS \u2014 your pick won")
+            s1, s2, s3 = st.columns(3)
+            s1.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">YOUR REAL PORTFOLIO</div>'
+                        f'<div style="font-size:19px;font-weight:700;color:{T["gold"]};margin-top:5px;">${sw["real_value"]:,.2f}</div></div>',
+                        unsafe_allow_html=True)
+            s2.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">WITH {swap_to} INSTEAD</div>'
+                        f'<div style="font-size:19px;font-weight:700;color:{T["text"]};margin-top:5px;">${sw["swap_value"]:,.2f}</div></div>',
+                        unsafe_allow_html=True)
+            s3.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">DIFFERENCE</div>'
+                        f'<div style="font-size:19px;font-weight:700;color:{d_c};margin-top:5px;">${sw["difference"]:+,.2f}</div></div>',
+                        unsafe_allow_html=True)
+            st.markdown(f'<div style="font-size:13px;color:{d_c};margin-top:6px;">\U0001f52c {verdict}</div>',
+                        unsafe_allow_html=True)
+            st.caption("Hindsight is educational, not predictive \u2014 use this to understand behavior differences, not to chase what already ran.")
+    else:
+        st.info("Record trades in MY PORTFOLIO first \u2014 the swap test replays your actual history.")
+
+    st.divider()
+
+    # ---- Compound Money Machine ----
+    st.markdown(f'##### \u2699\ufe0f The Compound Money Machine', unsafe_allow_html=True)
+    st.caption("Drag the sliders. Watch the curve bend. Exact monthly compounding math \u2014 the growth-rate scenarios use real historical CAGRs from your own board.")
+    cm1, cm2, cm3 = st.columns(3)
+    with cm1: mm_monthly = st.slider("Monthly investment ($)", 50, 2000, 300, 50)
+    with cm2: mm_years   = st.slider("Years", 5, 45, 30, 5)
+    with cm3: mm_start   = st.number_input("Starting amount ($)", min_value=0.0,
+                                            value=float(sum(load_portfolio() and
+                                                [tr["amount"] for tr in load_portfolio()] or [0])),
+                                            step=100.0, key="mm_start")
+    voo_hist = trailing_ann(prices["VOO"].dropna(), 10)/100 if "VOO" in prices.columns else 0.10
+    scen = [("Conservative 6%", 0.06, T["text2"]), ("Historical S&P ~10%", 0.10, T["gold"]),
+            (f"VOO 10-yr actual {voo_hist*100:.1f}%", voo_hist, T["green"]), ("Optimistic 13%", 0.13, "#00bfff")]
+    mfig = go.Figure()
+    end_vals = {}
+    for name, rate, colr in scen:
+        srs = compound_series(mm_monthly, mm_years, rate, mm_start)
+        end_vals[name] = (srs.iloc[-1], colr)
+        mfig.add_trace(go.Scatter(x=srs.index, y=srs.values, name=name, mode="lines",
+                                  line=dict(width=2.4, color=colr)))
+    invested_line = [mm_start + mm_monthly*12*y for y in np.linspace(0, mm_years, mm_years*12+1)]
+    mfig.add_trace(go.Scatter(x=list(np.linspace(0, mm_years, mm_years*12+1)), y=invested_line,
+                              name="Cash you put in", mode="lines",
+                              line=dict(width=1.6, color=T["text3"], dash="dot")))
+    mfig.update_layout(template="plotly_dark", height=430, paper_bgcolor=T["bg"], plot_bgcolor=T["bg"],
+                       hovermode="x unified", xaxis_title="Years", yaxis_title="Portfolio value ($)",
+                       legend=dict(orientation="h", y=-0.18), font=dict(family="Roboto Mono", size=11))
+    mfig.update_xaxes(gridcolor=T["bg3"]); mfig.update_yaxes(gridcolor=T["bg3"], tickformat="$,.0f")
+    st.plotly_chart(mfig, use_container_width=True)
+    total_in_mm = mm_start + mm_monthly*12*mm_years
+    mid_val = end_vals.get("Historical S&P ~10%", (0, ""))[0]
+    st.markdown(f'<div style="font-size:13px;color:{T["text2"]};">'
+                f'You contribute <b style="color:{T["text"]};">${total_in_mm:,.0f}</b> over {mm_years} years. '
+                f'At the historical ~10%, compounding turns it into '
+                f'<b style="color:{T["gold"]};">${mid_val:,.0f}</b> \u2014 '
+                f'<b style="color:{T["green"]};">${mid_val-total_in_mm:,.0f}</b> of that is growth doing the work, not you.</div>',
+                unsafe_allow_html=True)
+
+# ================================================================ TAB: MY PROFILE
+with tab_profile:
+    st.markdown('<div class="lbl">Investor Profile \u2014 who you are shapes every recommendation</div>',
+                unsafe_allow_html=True)
+    prof = load_profile()
+
+    if prof.get("type"):
+        st.markdown(f'<div style="border:1px solid {T["gold"]};border-radius:10px;padding:20px 24px;background:{T["bg2"]};margin-bottom:14px;">'
+                    f'<div style="font-size:10px;color:{T["text3"]};text-transform:uppercase;letter-spacing:2px;">Your investor type \u00b7 assessed {prof.get("taken_at","")}</div>'
+                    f'<div style="font-family:Oswald;font-size:26px;font-weight:700;color:{T["gold"]};margin:6px 0;">{prof["type"]}</div>'
+                    f'<div style="font-size:12.5px;color:{T["text2"]};line-height:1.7;">{prof["description"]}</div>'
+                    f'<div style="font-size:11px;color:{T["text3"]};margin-top:8px;">Risk capacity score: {prof["score"]}/{prof["max"]} ({prof["pct"]}%) \u00b7 '
+                    f'This profile is injected into the AI Advisor\u2019s context \u2014 every answer it gives is calibrated to who you are.</div>'
+                    f'</div>', unsafe_allow_html=True)
+        if st.button("Retake the quiz", key="retake_quiz"):
+            save_profile({})
+            st.rerun()
+    else:
+        st.markdown(f'<div style="font-size:12.5px;color:{T["text2"]};margin-bottom:14px;">'
+                    f'Six questions, two minutes. Your answers create a persistent investor profile that '
+                    f'personalizes the AI Advisor, recommendations, and risk warnings across the whole platform.</div>',
+                    unsafe_allow_html=True)
+        with st.form("profile_quiz"):
+            answers = {}
+            for i, (key, question, options) in enumerate(QUIZ):
+                choice = st.radio(f"**{i+1}. {question}**", [o[0] for o in options],
+                                  key=f"quiz_{key}", index=None)
+                if choice is not None:
+                    answers[key] = dict(options)[choice]
+            submitted_quiz = st.form_submit_button("Get my investor profile", use_container_width=True)
+            if submitted_quiz:
+                if len(answers) < len(QUIZ):
+                    st.warning("Answer all six questions to get your profile.")
+                else:
+                    result = score_quiz(answers)
+                    save_profile(result)
+                    st.rerun()
+
+    # ---- Dividend tax estimator ----
+    st.markdown(f'<div class="lbl">{gloss("Qualified dividend","Dividend Tax Estimator")} \u2014 what you\u2019d owe even without selling</div>',
+                unsafe_allow_html=True)
+    st.caption("Reinvested dividends in a TAXABLE account are still taxed the year they're paid \u2014 reinvesting doesn't defer them. "
+               "(Selling shares for gains is a separate tax you only pay when you sell.)")
+    tax_trades = load_portfolio()
+    if tax_trades:
+        tax_pnl = compute_pnl(tax_trades, prices, live_quotes=live_q)
+        if not tax_pnl.empty:
+            vals_by_t = tax_pnl.groupby("Ticker")["Cur. Value $"].sum().to_dict()
+            div_info_t = get_dividend_info(tuple(vals_by_t.keys()))
+            div_by_t = {t: v * div_info_t.get(t, 0)/100 for t, v in vals_by_t.items()}
+            bracket = st.selectbox("Your annual taxable income bracket:",
+                                   ["~$0-47k (student)", "$47k-100k", "$100k-500k", "$500k+"],
+                                   index=0, key="tax_bracket")
+            est = dividend_tax_estimate(div_by_t, bracket)
+            tx1, tx2, tx3 = st.columns(3)
+            tx1.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">ANNUAL DIVIDENDS</div>'
+                         f'<div style="font-size:20px;font-weight:700;color:{T["green"]};margin-top:5px;">${est["total_div"]:,.2f}</div></div>',
+                         unsafe_allow_html=True)
+            tx2.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">EST. TAX OWED / YR</div>'
+                         f'<div style="font-size:20px;font-weight:700;color:{T["orange"]};margin-top:5px;">${est["total_tax"]:,.2f}</div></div>',
+                         unsafe_allow_html=True)
+            keep_pct = (1 - est["total_tax"]/est["total_div"])*100 if est["total_div"] else 100
+            tx3.markdown(f'<div class="card" style="text-align:center;"><div style="font-size:10px;color:{T["text3"]};">YOU KEEP</div>'
+                         f'<div style="font-size:20px;font-weight:700;color:{T["text"]};margin-top:5px;">{keep_pct:.1f}%</div></div>',
+                         unsafe_allow_html=True)
+            if est["rows"]:
+                st.dataframe(pd.DataFrame(est["rows"]), hide_index=True, use_container_width=True)
+            if bracket == "~$0-47k (student)":
+                st.markdown(f'<div style="font-size:12px;color:{T["green"]};">'
+                            f'\u2705 Good news: at student income levels, QUALIFIED dividends are taxed at 0%. '
+                            f'Your only drag is the small ordinary-income slice (mostly from VXUS\u2019s foreign dividends). '
+                            f'A Roth IRA would shelter even that \u2014 and locks in tax-free growth for 40 years.</div>',
+                            unsafe_allow_html=True)
+            st.caption("Estimates only \u2014 assumes typical qualified-dividend percentages per fund type. Not tax advice; consult a tax professional for filings.")
+    else:
+        st.info("Record your trades in MY PORTFOLIO to see your dividend tax picture.")
+
 # ================================================================ TAB 4: AI ADVISOR
 with tab_ai:
     st.markdown('<div class="lbl">AI Investment Advisor — knows your portfolio, market data, and 70+ ETFs</div>',
@@ -1647,6 +2320,13 @@ with tab_ai:
         all_cats    = {"core","growth","tech","semis","dividend","value","factor","sector","intl","smallmid","realasset","bond","thematic"}
         missing_str = ", ".join(CAT_LABEL.get(c,c) for c in all_cats-held_cats)
         memory_ctx  = build_memory_context(st.session_state.conv_id)
+        prof_ai     = load_profile()
+        profile_ctx = ""
+        if prof_ai.get("type"):
+            profile_ctx = (f"INVESTOR PROFILE (from their quiz, {prof_ai.get('taken_at','')}): "
+                           f"{prof_ai['type']} \u2014 {prof_ai['description']} "
+                           f"Risk capacity {prof_ai['pct']}%. Calibrate ALL advice to this profile: "
+                           f"risk warnings, allocation suggestions, and tone.")
 
         sys_prompt = (
             "You are an expert ETF investment advisor for a 20-year-old F-1 visa student "
@@ -1659,6 +2339,7 @@ with tab_ai:
             f"MACRO: {macro_str}\n\n"
             f"TOP NON-HELD OPPS:\n" + "\n".join(opp_l) + "\n\n"
             f"MISSING CATEGORIES: {missing_str}\n\n"
+            f"{profile_ctx}\n\n"
             f"{memory_ctx}\n\n"
             "INSTRUCTIONS: Be direct, data-backed, beginner-friendly. Give real tickers. "
             "Reference prior conversations naturally when relevant. "
