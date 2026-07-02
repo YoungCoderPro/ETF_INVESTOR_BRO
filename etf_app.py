@@ -288,6 +288,89 @@ def compute_overlap(focus: str, compare: list) -> dict:
                 overlap[stock]["in_others"][t] = t_h[stock]
     return overlap
 
+# ================================================================ NEW: LIVE QUOTES (3-min cache)
+
+@st.cache_data(ttl=60*3, show_spinner=False)
+def get_live_quotes(tickers: tuple) -> dict:
+    """
+    Most-current prices available for free via Yahoo Finance.
+    Uses 1-minute intraday bars for today — Yahoo applies ~15 min delay
+    during market hours (unavoidable without a paid real-time feed).
+    After market close, returns the final settled close price.
+    Falls back to fast_info if intraday bars are unavailable.
+    Returns: dict  ticker -> {price, prev_close, chg_pct, as_of}
+    """
+    quotes  = {}
+    # ---- Try 1-min bars for today (most granular free data) ----
+    try:
+        raw = yf.download(list(tickers), period="1d", interval="1m",
+                          auto_adjust=True, progress=False)
+        if not raw.empty:
+            close = raw["Close"] if "Close" in raw.columns else raw
+            if isinstance(close, pd.Series):
+                close = close.to_frame(name=tickers[0])
+            for t in tickers:
+                if t in close.columns:
+                    s = close[t].dropna()
+                    if not s.empty:
+                        quotes[t] = {
+                            "price":  round(float(s.iloc[-1]), 2),
+                            "as_of":  s.index[-1].strftime("%H:%M"),
+                            "source": "1m bar (~15min delayed)"
+                        }
+    except Exception:
+        pass
+    # ---- Fallback: fast_info for any tickers still missing ----
+    for t in [t for t in tickers if t not in quotes]:
+        try:
+            fi = yf.Ticker(t).fast_info
+            p  = fi.get("last_price") or fi.get("lastPrice")
+            pc = fi.get("previous_close") or fi.get("previousClose")
+            if p:
+                quotes[t] = {
+                    "price":  round(float(p), 2),
+                    "as_of":  "~15min delayed",
+                    "source": "fast_info"
+                }
+                if pc:
+                    quotes[t]["prev_close"] = round(float(pc), 2)
+        except Exception:
+            pass
+    # ---- Add day-change % where we have prev_close ----
+    for t, q in quotes.items():
+        if "prev_close" not in q:
+            # pull prev_close from 2-day history
+            try:
+                h = yf.download(t, period="5d", interval="1d",
+                                auto_adjust=True, progress=False)["Close"].dropna()
+                if len(h) >= 2:
+                    q["prev_close"] = round(float(h.iloc[-2]), 2)
+            except Exception:
+                pass
+        if "prev_close" in q and q["prev_close"]:
+            q["chg_pct"] = round((q["price"]-q["prev_close"])/q["prev_close"]*100, 2)
+        else:
+            q["chg_pct"] = 0.0
+    return quotes
+
+def get_market_status() -> dict:
+    """Check whether NYSE is currently open (no external API needed)."""
+    try:
+        import pytz
+        et = dt.datetime.now(pytz.timezone("America/New_York"))
+    except Exception:
+        # Rough UTC-4 approximation (EDT) if pytz not installed
+        et = dt.datetime.utcnow() - dt.timedelta(hours=4)
+    is_weekday = et.weekday() < 5
+    is_hours   = dt.time(9, 30) <= et.time() <= dt.time(16, 0)
+    is_open    = is_weekday and is_hours
+    return {
+        "is_open": is_open,
+        "label":   "\U0001f7e2 MARKET OPEN" if is_open else "\U0001f534 MARKET CLOSED",
+        "tip":     "prices ~15 min delayed" if is_open else "showing last close",
+        "time_et": et.strftime("%H:%M ET"),
+    }
+
 # ================================================================ NEW: MARKET DATA
 
 @st.cache_data(ttl=60*60*3, show_spinner=False)
@@ -605,7 +688,7 @@ def build_memory_context(current_conv_id: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
+def compute_pnl(trades: list, prices: pd.DataFrame, live_quotes: dict = None) -> pd.DataFrame:
     rows = []
     for trade in trades:
         t, amount = trade["ticker"], float(trade["amount"])
@@ -614,18 +697,23 @@ def compute_pnl(trades: list, prices: pd.DataFrame) -> pd.DataFrame:
         buy_dt = pd.Timestamp(trade["date"])
         future = s[s.index >= buy_dt]
         buy_px = float(future.iloc[0]) if not future.empty else float(s.iloc[0])
-        curr_v = (amount/buy_px)*float(s.iloc[-1])
+        # Use live quote when available — most current price
+        if live_quotes and t in live_quotes:
+            curr_px = live_quotes[t]["price"]
+        else:
+            curr_px = float(s.iloc[-1])
+        curr_v = (amount / buy_px) * curr_px
         gain   = curr_v - amount
-        pct    = gain/amount*100
-        days   = max((pd.Timestamp.today()-buy_dt).days, 1)
+        pct    = gain / amount * 100
+        days   = max((pd.Timestamp.today() - buy_dt).days, 1)
         try:
-            ann = pct if days<14 else float(np.clip((curr_v/amount)**(365.0/days)-1, -0.999, 500)*100)
+            ann = pct if days < 14 else float(np.clip((curr_v/amount)**(365.0/days)-1, -0.999, 500)*100)
         except (OverflowError, ZeroDivisionError, ValueError):
             ann = pct
-        rows.append({"ID":trade.get("id",""),"Ticker":t,"Date":trade["date"],
-                     "Invested $":round(amount,2),"Cur. Value $":round(curr_v,2),
-                     "Gain $":round(gain,2),"Return %":round(pct,2),
-                     "Ann. %":round(ann,2),"Days":days,"Note":trade.get("note","")})
+        rows.append({"ID": trade.get("id",""), "Ticker": t, "Date": trade["date"],
+                     "Invested $": round(amount, 2), "Cur. Value $": round(curr_v, 2),
+                     "Gain $": round(gain, 2), "Return %": round(pct, 2),
+                     "Ann. %": round(ann, 2), "Days": days, "Note": trade.get("note","")})
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 # ================================================================ UI SETUP
@@ -735,40 +823,82 @@ with st.sidebar:
                                                role="Custom", er=float("nan"))
             st.success(f"Added {info['ticker']} @ ${info['price']:.2f}")
     st.markdown("---")
-    st.markdown(f'<div style="font-size:10.5px;color:{T["text3"]};line-height:1.7;">'
+    mkt = get_market_status()
+    mkt_color = T["green"] if mkt["is_open"] else T["red"]
+    st.markdown(f'<div style="font-size:11px;color:{mkt_color};font-weight:600;">{mkt["label"]}</div>'
+                f'<div style="font-size:10px;color:{T["text3"]};">{mkt["time_et"]} \u00b7 {mkt["tip"]}</div>',
+                unsafe_allow_html=True)
+    if st.button("\U0001f504 Refresh prices now", use_container_width=True):
+        load_prices.clear()
+        get_live_quotes.clear()
+        get_market_news.clear()
+        st.rerun()
+    st.markdown(f'<div style="font-size:10.5px;color:{T["text3"]};line-height:1.7;margin-top:8px;">'
                 f'\U0001f4f1 <b>Mobile:</b> Network URL in terminal \u2192 phone browser<br>'
                 f'\U0001f310 <b>Live site:</b> push to GitHub \u2192 share.streamlit.io<br>'
-                f'\U0001f504 Prices 6h \u00b7 intraday 5min \u00b7 F&G 3h \u00b7 news 2h</div>',
+                f'\U0001f504 Historical 6h \u00b7 live quotes 3min \u00b7 intraday 5min</div>',
                 unsafe_allow_html=True)
 
 sel = tuple(dict.fromkeys(st.session_state.selected))
 
-# ================================================================ LOAD PRICES
-with st.spinner(f"Fetching live total-return data for {len(sel)} ETFs\u2026"):
+# ================================================================ LOAD PRICES + LIVE QUOTES
+with st.spinner(f"Fetching total-return history for {len(sel)} ETFs\u2026"):
     try:
         prices = load_prices(sel, days=3650)
     except Exception as e:
         st.error(f"Data fetch failed: {e}"); st.stop()
+
+# Live quotes: short-cache refresh separate from historical bars
+with st.spinner("Fetching current prices\u2026"):
+    try:
+        live_q = get_live_quotes(sel)
+    except Exception:
+        live_q = {}
+
+mkt = get_market_status()
 
 # ================================================================ MASTHEAD + TAPE
 _icon_path = Path(__file__).parent/"icon.png"
 _b64 = base64.b64encode(_icon_path.read_bytes()).decode() if _icon_path.exists() else ""
 _img = f"<img src='data:image/png;base64,{_b64}' style='width:54px;height:54px;border-radius:10px;'>" if _b64 else ""
 
-st.markdown(f'<div class="masthead">{_img}<div><h1>ETF INVESTOR BRO</h1>'
-            f'<span class="tag">Live Total-Return Terminal \u00b7 Dividends Reinvested \u00b7 {dt.date.today()}</span>'
-            f'</div></div>', unsafe_allow_html=True)
+mkt_color = T["green"] if mkt["is_open"] else T["red"]
+# Find the freshest quote timestamp across all tickers
+_as_of_times = [q.get("as_of","") for q in live_q.values() if q.get("as_of","")]
+_freshest    = max(_as_of_times) if _as_of_times else "historical close"
 
+st.markdown(
+    f'<div class="masthead">{_img}'
+    f'<div style="flex:1;">'
+    f'<h1>ETF INVESTOR BRO</h1>'
+    f'<span class="tag">Total-Return Terminal \u00b7 Dividends Reinvested \u00b7 {dt.date.today()}</span>'
+    f'</div>'
+    f'<div style="text-align:right;">'
+    f'<div style="font-size:12px;font-weight:700;color:{mkt_color};">{mkt["label"]}</div>'
+    f'<div style="font-size:10px;color:{T["text3"]};">{mkt["time_et"]} \u00b7 quotes as of {_freshest}</div>'
+    f'<div style="font-size:10px;color:{T["text3"]};">{mkt["tip"]} \u00b7 auto-refresh 3 min</div>'
+    f'</div></div>',
+    unsafe_allow_html=True)
+
+# Ticker tape — uses live quotes for price & day-change
 tape_html = ""
 for t in sel:
-    if t not in prices.columns: continue
-    s = prices[t].dropna()
-    if len(s)<2: continue
-    chg = (s.iloc[-1]/s.iloc[-2]-1)*100
-    cls = "up" if chg>=0 else "dn"
+    # Prefer live quote; fall back to last historical close
+    q = live_q.get(t)
+    if q:
+        price  = q["price"]
+        chg    = q.get("chg_pct", 0)
+    elif t in prices.columns:
+        s      = prices[t].dropna()
+        if len(s) < 2: continue
+        price  = float(s.iloc[-1])
+        chg    = (s.iloc[-1]/s.iloc[-2]-1)*100
+    else:
+        continue
+    cls = "up" if chg >= 0 else "dn"
+    arr = "&#9650;" if chg >= 0 else "&#9660;"
     tape_html += (f'<span class="tape-item"><span class="tape-tk">{t}</span> '
-                  f'${s.iloc[-1]:.2f} <span class="{cls}">{"&#9650;" if chg>=0 else "&#9660;"} '
-                  f'{chg:+.2f}%</span></span>')
+                  f'${price:.2f} <span class="{cls}">{arr} {chg:+.2f}%</span></span>')
 st.markdown(f'<div class="tape-wrap"><div class="tape">{tape_html*3}</div></div>',
             unsafe_allow_html=True)
 
@@ -781,6 +911,14 @@ tab_board, tab_pf, tab_pulse, tab_ai, tab_chart = st.tabs([
 with tab_board:
     st.markdown('<div class="lbl">Performance Board \u2014 Total Return (dividends reinvested, fees included)</div>',
                 unsafe_allow_html=True)
+    # Show data freshness note
+    if live_q:
+        as_of_list = [q.get("as_of","") for q in live_q.values() if q.get("as_of","")]
+        fresh_str  = f"Prices as of {max(as_of_list)} (Yahoo ~15 min delayed)" if as_of_list else ""
+        if fresh_str:
+            st.caption(f"\U0001f551 {fresh_str} \u00b7 "
+                       f"{'Market open \u2014 updates every 3 min' if mkt['is_open'] else 'Market closed \u2014 showing last close'} "
+                       f"\u00b7 hit \u201cRefresh prices now\u201d in sidebar to force update")
     dfm   = compute_metrics(prices, "VOO")
     order = {t:i for i,t in enumerate(sel)}
     dfm   = dfm.sort_values("Ticker", key=lambda c: c.map(lambda t: order.get(t,99)))
@@ -792,18 +930,26 @@ with tab_board:
 
     rows_html = ""
     for _, r in dfm.iterrows():
-        held    = r["Ticker"] in OWNED
+        held     = r["Ticker"] in OWNED
         held_tag = '<span class="htag">HELD</span>' if held else ""
-        er_str  = f'{r["ER"]:.2f}%' if pd.notna(r["ER"]) else "\u2014"
-        sh      = r["Sharpe"]
-        sh_html = (f'<span class="sbg"><span class="sfill" style="width:{max(min(sh/2.0,1),0)*100:.0f}%">'
-                   f'</span></span>{sh:.2f}') if pd.notna(sh) else "n/a"
-        corr_v  = r["Corr\u2192VOO"]
-        corr_s  = "n/a" if pd.isna(corr_v) else f"{float(corr_v):.2f}"
+        er_str   = f'{r["ER"]:.2f}%' if pd.notna(r["ER"]) else "\u2014"
+        sh       = r["Sharpe"]
+        sh_html  = (f'<span class="sbg"><span class="sfill" style="width:{max(min(sh/2.0,1),0)*100:.0f}%">'
+                    f'</span></span>{sh:.2f}') if pd.notna(sh) else "n/a"
+        corr_v   = r["Corr\u2192VOO"]
+        corr_s   = "n/a" if pd.isna(corr_v) else f"{float(corr_v):.2f}"
+        lq       = live_q.get(r["Ticker"], {})
+        live_px  = lq.get("price")
+        # Green dot ● next to price = live quote; no dot = historical close
+        if live_px:
+            price_html = (f'${live_px:.2f} '
+                          f'<span style="color:{T["green"]};font-size:9px;" title="live quote">\u25cf</span>')
+        else:
+            price_html = f'${r["Price"]:.2f}'
         rows_html += (f'<tr class="{"row-h" if held else "row-w"}">'
             f'<td><span class="tk">{r["Ticker"]}</span>{held_tag}'
             f'<span class="tkn">{r["Category"]}</span></td>'
-            f'<td>${r["Price"]:.2f}</td><td>{er_str}</td>'
+            f'<td>{price_html}</td><td>{er_str}</td>'
             f'<td>{cell(r["1Y TR %"])}</td><td>{cell(r["3Y Ann %"])}</td>'
             f'<td>{cell(r["5Y Ann %"])}</td><td>{cell(r["10Y Ann %"])}</td>'
             f'<td>{r["Vol %"]:.1f}%</td><td>{sh_html}</td>'
@@ -1030,7 +1176,8 @@ with tab_pf:
         all_t = tuple(set(t["ticker"] for t in trades)|set(sel))
         try:    pf_px = load_prices(all_t)
         except: pf_px = prices
-        pnl_df = compute_pnl(trades, pf_px)
+        # Pass live quotes so P&L reflects most current prices
+        pnl_df = compute_pnl(trades, pf_px, live_quotes=live_q)
 
         if not pnl_df.empty:
             ti  = pnl_df["Invested $"].sum()
@@ -1466,7 +1613,7 @@ with tab_ai:
         dfm_ai    = compute_metrics(prices, "VOO")
         sigs_ai   = compute_signals(prices[[t for t in sel if t in prices.columns]])
         trades_ai = load_portfolio()
-        pnl_ai    = compute_pnl(trades_ai, prices) if trades_ai else pd.DataFrame()
+        pnl_ai    = compute_pnl(trades_ai, prices, live_quotes=live_q) if trades_ai else pd.DataFrame()
         fg_ai     = get_fear_greed()
         macro_ai  = get_macro_snapshot()
 
