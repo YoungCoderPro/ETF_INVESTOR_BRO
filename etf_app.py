@@ -293,64 +293,63 @@ def compute_overlap(focus: str, compare: list) -> dict:
 @st.cache_data(ttl=60*3, show_spinner=False)
 def get_live_quotes(tickers: tuple) -> dict:
     """
-    Most-current prices available for free via Yahoo Finance.
-    Uses 1-minute intraday bars for today — Yahoo applies ~15 min delay
-    during market hours (unavoidable without a paid real-time feed).
-    After market close, returns the final settled close price.
-    Falls back to fast_info if intraday bars are unavailable.
-    Returns: dict  ticker -> {price, prev_close, chg_pct, as_of}
+    Current prices that match what a broker (Schwab, Fidelity) shows.
+
+    KEY: uses RAW / UNADJUSTED prices (auto_adjust=False) so the number equals
+    the actual market price your broker displays. (Our historical metrics use
+    auto_adjust=True for total-return math — that's correct there, but adjusted
+    prices are dividend-back-adjusted and won't match a broker's quote.)
+
+    Day-change = (last_price - previous_close) / previous_close, exactly the
+    basis brokers use. Primary source is yf fast_info (last_price +
+    previous_close, both raw). Falls back to a raw daily download.
+
+    Yahoo's free data is ~15 min delayed during market hours — unavoidable
+    without a paid real-time feed. After close, prices match the broker exactly.
+    Returns: dict  ticker -> {price, prev_close, chg_pct, as_of, source}
     """
-    quotes  = {}
-    # ---- Try 1-min bars for today (most granular free data) ----
-    try:
-        raw = yf.download(list(tickers), period="1d", interval="1m",
-                          auto_adjust=True, progress=False)
-        if not raw.empty:
-            close = raw["Close"] if "Close" in raw.columns else raw
-            if isinstance(close, pd.Series):
-                close = close.to_frame(name=tickers[0])
-            for t in tickers:
-                if t in close.columns:
-                    s = close[t].dropna()
-                    if not s.empty:
-                        quotes[t] = {
-                            "price":  round(float(s.iloc[-1]), 2),
-                            "as_of":  s.index[-1].strftime("%H:%M"),
-                            "source": "1m bar (~15min delayed)"
-                        }
-    except Exception:
-        pass
-    # ---- Fallback: fast_info for any tickers still missing ----
-    for t in [t for t in tickers if t not in quotes]:
+    quotes = {}
+    for t in tickers:
+        price = prev = None
+        as_of = "~15 min delayed"
+        source = "fast_info"
+        # ---- Primary: fast_info (raw last price + official previous close) ----
         try:
             fi = yf.Ticker(t).fast_info
-            p  = fi.get("last_price") or fi.get("lastPrice")
-            pc = fi.get("previous_close") or fi.get("previousClose")
-            if p:
-                quotes[t] = {
-                    "price":  round(float(p), 2),
-                    "as_of":  "~15min delayed",
-                    "source": "fast_info"
-                }
-                if pc:
-                    quotes[t]["prev_close"] = round(float(pc), 2)
+            price = fi.get("last_price") or fi.get("lastPrice")
+            prev  = fi.get("previous_close") or fi.get("previousClose")
         except Exception:
             pass
-    # ---- Add day-change % where we have prev_close ----
-    for t, q in quotes.items():
-        if "prev_close" not in q:
-            # pull prev_close from 2-day history
+        # ---- Fallback: raw daily bars (auto_adjust=False = broker prices) ----
+        if price is None or prev is None:
             try:
                 h = yf.download(t, period="5d", interval="1d",
-                                auto_adjust=True, progress=False)["Close"].dropna()
+                                auto_adjust=False, progress=False)["Close"].dropna()
                 if len(h) >= 2:
-                    q["prev_close"] = round(float(h.iloc[-2]), 2)
+                    today = dt.date.today()
+                    # If last bar is today's (partial) bar, prev close is the one before
+                    if h.index[-1].date() == today:
+                        if price is None: price = float(h.iloc[-1])
+                        if prev  is None: prev  = float(h.iloc[-2])
+                    else:
+                        if price is None: price = float(h.iloc[-1])
+                        if prev  is None: prev  = float(h.iloc[-2])
+                    source = "daily close (raw)"
+                    as_of  = h.index[-1].strftime("%b %d")
+                elif len(h) == 1 and price is None:
+                    price = float(h.iloc[-1]); prev = price
             except Exception:
                 pass
-        if "prev_close" in q and q["prev_close"]:
-            q["chg_pct"] = round((q["price"]-q["prev_close"])/q["prev_close"]*100, 2)
-        else:
-            q["chg_pct"] = 0.0
+        if price is None:
+            continue
+        chg = ((price - prev) / prev * 100) if prev else 0.0
+        quotes[t] = {
+            "price":      round(float(price), 2),
+            "prev_close": round(float(prev), 2) if prev else None,
+            "chg_pct":    round(float(chg), 2),
+            "as_of":      as_of,
+            "source":     source,
+        }
     return quotes
 
 def get_market_status() -> dict:
@@ -916,7 +915,7 @@ with tab_board:
         as_of_list = [q.get("as_of","") for q in live_q.values() if q.get("as_of","")]
         fresh_str  = f"Prices as of {max(as_of_list)} (Yahoo ~15 min delayed)" if as_of_list else ""
         if fresh_str:
-            st.caption(f"\U0001f551 {fresh_str} \u00b7 "
+            st.caption(f"\U0001f551 {fresh_str} \u00b7 raw market prices (match your broker) \u00b7 "
                        f"{'Market open \u2014 updates every 3 min' if mkt['is_open'] else 'Market closed \u2014 showing last close'} "
                        f"\u00b7 hit \u201cRefresh prices now\u201d in sidebar to force update")
     dfm   = compute_metrics(prices, "VOO")
